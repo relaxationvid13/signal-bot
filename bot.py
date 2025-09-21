@@ -10,6 +10,23 @@ import os, sys, time, json, logging
 from datetime import datetime
 import pytz, requests, telebot
 
+# ---------- добавлено для Render (держим открытый HTTP-порт) ----------
+from threading import Thread
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.get("/")
+def healthcheck():
+    return "ok"
+
+def run_http():
+    # Render передаёт порт через переменную окружения PORT
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+# ---------------------------------------------------------------------
+
+
 # ===== Секреты из окружения =====
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
@@ -40,6 +57,7 @@ DEFAULT_TIMEOUT = 15
 # Память за день
 signals = []          # [{fixture_id, home, away, league, country, minute, goals_home, goals_away}]
 signaled_ids = set()  # чтобы не дублировать сигнал
+
 
 # ===== Утилиты =====
 def now_local():
@@ -97,6 +115,7 @@ def get_fixture_result(fid: int):
     except Exception as e:
         log.error(f"get_fixture_result({fid}) error: {e}")
         return None
+
 
 # ===== Основная логика =====
 def scan_and_signal():
@@ -170,13 +189,17 @@ def send_daily_report():
 
     send("\n".join(lines))
 
+
 # ===== RUN =====
 if __name__ == "__main__":
+    # Поднять HTTP-сервер для Render (только Web Service / Free план)
+    Thread(target=run_http, daemon=True).start()
+
     load_state()
     send("🚀 Бот запущен — новая версия!")
     send("✅ Бот запущен (эконом: сигнал на ~20', отчёт в 23:30).")
+
     while True:
-        ...
         try:
             scan_and_signal()
 
