@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Стратегия: до 20' счёт 0–0 и кэф на ТМ 3.0 >= 1.60 → отправляем сигнал.
+Режим опроса:
+- Активное окно: 16:00–23:29 (Europe/Warsaw), опрос каждые 5 минут
+- В 23:30 — дневной отчёт, + недельный (вс) и месячный (последний день)
 
-Отчёты:
-- Дневной: 23:30 (Europe/Warsaw)
-- Недельный: по воскресеньям в 23:30
-- Месячный: в последний день месяца в 23:30
+Стратегии (обе включены):
+1) OVER-20: до 20' забито 2 или 3 → ТБ 3 / ТБ 4 (по умолчанию без кэфов)
+2) UNDER-20: до 20' счёт 0–0 → ТМ 3.0 с кэфом >= 1.60 (если odds доступны)
 
-Опрос API строго по «кварталам» часа (00/15/30/45), чтобы не drift'ить во времени.
-Для Render поднят HTTP healthcheck на '/' чтобы держать инстанс бодрым.
-
-✅ Обновление: учтён ПУШ для ТМ 3.0 — если итоговый тотал ровно 3, считаем возврат (♻ 0.00).
+Для Render — поднят HTTP healthcheck на '/'.
 """
 
 import os, sys, time, json, logging
@@ -20,7 +18,7 @@ import pytz
 import requests
 import telebot
 
-# ---------- Flask healthcheck (Render friendly) ----------
+# ---------- Flask healthcheck ----------
 from threading import Thread
 from flask import Flask
 app = Flask(__name__)
@@ -32,10 +30,10 @@ def healthcheck():
 def run_http():
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-# ---------------------------------------------------------
+# --------------------------------------
 
 
-# ============== Секреты / окружение ======================
+# ===== Секреты / окружение =====
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY   = os.getenv("API_FOOTBALL_KEY")
@@ -43,30 +41,47 @@ if not API_TOKEN or not CHAT_ID or not API_KEY:
     sys.exit("❌ Нет переменных окружения: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / API_FOOTBALL_KEY")
 CHAT_ID = int(CHAT_ID)
 
-# ============== Параметры стратегии ======================
-TIMEZONE       = "Europe/Warsaw"   # отчёты по польскому времени
-MAX_MINUTE     = 20                # учитываем только до/включая 20-ю минуту
-POLL_ALIGN     = True              # опрашиваем по 00/15/30/45 (иначе 15 минут от сна)
-STAKE_UNITS    = 1                 # условная ставка в отчётах (+1/-1)
-LINE_U3        = 3                 # линия ТМ 3.0
-ODDS_MIN_U3    = 1.60              # кэф на ТМ 3.0 должен быть >= 1.60
+# ===== Параметры =====
+TIMEZONE        = "Europe/Warsaw"
+MAX_MINUTE      = 20
 
-# odds (для получения кэфов нужен платный доступ в API-Football)
-ODDS_ENABLED         = True        # если нет доступа — просто не будет сигналов
-ODDS_BOOKMAKER_NAME  = None        # можно ограничить конкретным букмекером (строкой), иначе любой
+# Активное окно и частота опроса
+ACTIVE_START_H  = 16     # с 16:00
+ACTIVE_END_H    = 23     # до 23:29 (отчёты в 23:30)
+POLL_SEC        = 5 * 60 # каждые 5 минут
 
-LOG_FILE       = "bot.log"
-STATE_FILE     = "signals.json"
+# Ставка-единица для отчётов (+1/0/-1)
+STAKE_UNITS     = 1
 
-# ============== Логи =====================================
+# --- Стратегия 1: OVER-20 ---
+STRAT_OVER_20   = True
+ODDS_ENABLED_O  = False       # если True — фильтруем по кэфам
+ODDS_MIN_O      = 1.29
+ODDS_MAX_O      = 2.00
+LINE_O3         = 3.0         # при 2 голах
+LINE_O4         = 4.0         # при 3 голах
+
+# --- Стратегия 2: UNDER-20 ---
+STRAT_UNDER_20  = True
+ODDS_ENABLED_U  = True        # кэф обязателен
+ODDS_MIN_U3     = 1.60
+LINE_U3         = 3.0
+
+# odds доступны только на платных планах API-Football
+ODDS_BOOKMAKER_NAME = None    # можно ограничить, например "Pinnacle"
+
+LOG_FILE        = "bot.log"
+STATE_FILE      = "signals.json"
+
+# ===== Логи =====
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s"
 )
-log = logging.getLogger("u3-00-bot")
+log = logging.getLogger("signals-bot")
 
-# ============== Telegram =================================
+# ===== Telegram =====
 bot = telebot.TeleBot(API_TOKEN, parse_mode="Markdown")
 
 def send(text: str):
@@ -75,7 +90,7 @@ def send(text: str):
     except Exception as e:
         log.error(f"Telegram send error: {e}")
 
-# ============== API-Football ==============================
+# ===== API-Football =====
 API = requests.Session()
 API.headers.update({"x-apisports-key": API_KEY})
 DEFAULT_TIMEOUT = 15
@@ -105,50 +120,86 @@ def get_fixture_result(fid: int):
         log.error(f"get_fixture_result({fid}) error: {e}")
         return None
 
-def get_under3_odds(fid: int):
+# ===== Работа с кэфами (Over/Under) =====
+def _extract_ou_price(odds_response, target_kind: str, target_line: float):
     """
-    Пытаемся достать кэф на ТМ 3.0.
-    Требует odds-доступ в API-Football. Если недоступно или нет рынка — вернёт None.
+    target_kind: 'over' | 'under'
+    target_line: 3.0 / 4.0
+    Возвращает лучший (максимальный) найденный кэф.
     """
-    if not ODDS_ENABLED:
-        return None
+    best = None
     try:
-        r = API.get(f"https://v3.football.api-sports.io/odds?fixture={fid}", timeout=DEFAULT_TIMEOUT)
-        if r.status_code in (403, 404):
-            return None
-        r.raise_for_status()
-        resp = r.json().get("response", []) or []
+        for item in odds_response or []:
+            # возможные ключи: bookmaker{name}, bets[{name, values[{value, odd}]}]
+            bookmakers = item.get("bookmakers") or [item]  # на разных аккаунтах структура отличается
+            for bk in bookmakers:
+                bname = ""
+                if isinstance(bk.get("bookmaker"), dict):
+                    bname = (bk["bookmaker"].get("name") or "")
+                elif "bookmaker" in bk:
+                    bname = str(bk.get("bookmaker") or "")
+                if ODDS_BOOKMAKER_NAME and ODDS_BOOKMAKER_NAME.lower() not in bname.lower():
+                    continue
 
-        best = None
-        for bk in resp:
-            b_name = ""
-            if isinstance(bk.get("bookmaker"), dict):
-                b_name = (bk["bookmaker"].get("name") or "")
-            elif "bookmaker" in bk:
-                b_name = str(bk.get("bookmaker") or "")
-            if ODDS_BOOKMAKER_NAME and ODDS_BOOKMAKER_NAME.lower() not in b_name.lower():
-                continue
-
-            for bet in bk.get("bets", []) or []:
-                name = (bet.get("name") or "").lower()
-                if "over" in name and "under" in name:  # рынок Over/Under
-                    for v in bet.get("values", []) or []:
-                        val = (v.get("value") or "").replace(" ", "").lower()
-                        if val in ("under3", "under3.0"):
-                            try:
-                                price = float(v.get("odd"))
-                                if best is None or price > best:
-                                    best = price
-                            except Exception:
-                                pass
+                for bet in bk.get("bets", []) or []:
+                    name = (bet.get("name") or "").lower()
+                    if "over" in name and "under" in name:
+                        for v in bet.get("values", []) or []:
+                            raw = (v.get("value") or "").strip().lower().replace(" ", "")
+                            # допускаем варианты типа "over3", "over3.0", "under4", ...
+                            if raw in (f"{target_kind}{int(target_line)}", f"{target_kind}{target_line:g}"):
+                                try:
+                                    price = float(v.get("odd"))
+                                    if best is None or price > best:
+                                        best = price
+                                except:
+                                    pass
         return best
+    except Exception as e:
+        log.error(f"_extract_ou_price error: {e}")
+        return None
+
+def get_over_odds(fid: int, line: float):
+    """Кэф на ТБ line (3/4)."""
+    try:
+        # пробуем odds-live
+        r = API.get(f"https://v3.football.api-sports.io/odds-live?fixture={fid}", timeout=DEFAULT_TIMEOUT)
+        if r.ok:
+            resp = r.json().get("response", []) or []
+            p = _extract_ou_price(resp, "over", line)
+            if p is not None:
+                return p
+        # fallback: статичный odds
+        r = API.get(f"https://v3.football.api-sports.io/odds?fixture={fid}", timeout=DEFAULT_TIMEOUT)
+        if not r.ok:
+            return None
+        resp = r.json().get("response", []) or []
+        return _extract_ou_price(resp, "over", line)
+    except Exception as e:
+        log.warning(f"get_over_odds({fid},{line}) warn: {e}")
+        return None
+
+def get_under3_odds(fid: int):
+    """Кэф на ТМ 3.0."""
+    try:
+        r = API.get(f"https://v3.football.api-sports.io/odds-live?fixture={fid}", timeout=DEFAULT_TIMEOUT)
+        if r.ok:
+            resp = r.json().get("response", []) or []
+            p = _extract_ou_price(resp, "under", 3.0)
+            if p is not None:
+                return p
+        r = API.get(f"https://v3.football.api-sports.io/odds?fixture={fid}", timeout=DEFAULT_TIMEOUT)
+        if not r.ok:
+            return None
+        resp = r.json().get("response", []) or []
+        return _extract_ou_price(resp, "under", 3.0)
     except Exception as e:
         log.warning(f"get_under3_odds({fid}) warn: {e}")
         return None
 
-# ============== Состояние (переживает перезапуск) =========
+# ===== Состояние =====
 signals = []          # [{fixture_id, ts_utc, home, away, league, country, minute, goals_home, goals_away, market, line, odds}]
-signaled_ids = set()  # чтобы не дублировать один и тот же матч
+signaled_ids = set()  # ключи: "<fid>-OVER" / "<fid>-UNDER"
 
 def save_state():
     try:
@@ -168,33 +219,27 @@ def load_state():
     except Exception as e:
         log.error(f"load_state error: {e}")
 
-# ============== Время / расписание ========================
+# ===== Время =====
 def tz():
     return pytz.timezone(TIMEZONE)
 
 def now_local():
     return datetime.now(tz())
 
-def sleep_to_next_quarter():
-    """Спим до ближайших 00/15/30/45 минут."""
-    n = now_local()
-    q = (n.minute // 15 + 1) * 15
-    if q >= 60:
-        target = n.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    else:
-        target = n.replace(minute=q, second=0, microsecond=0)
-    sec = max(1, int((target - n).total_seconds()))
-    log.info(f"Сплю до {target.strftime('%H:%M')} (~{sec} сек)")
-    time.sleep(sec)
+def in_active_window(n: datetime) -> bool:
+    """true, если 16:00 ≤ time ≤ 23:29 (по Europe/Warsaw)."""
+    hh, mm = n.hour, n.minute
+    if hh < ACTIVE_START_H:
+        return False
+    if hh > ACTIVE_END_H:
+        return False
+    if hh < ACTIVE_END_H:
+        return True
+    # hh == 23 → до 23:29
+    return mm <= 29
 
-# ============== Сканер: U3 (0-0 и odds >= 1.60) ===========
-def scan_u3_with_odds():
-    """
-    Сигнал только если:
-      - elapsed <= 20
-      - счёт 0-0
-      - odds(ТМ 3.0) >= 1.60
-    """
+# ===== Скан обеих стратегий =====
+def scan_and_signal():
     live = get_live()
     for m in live:
         try:
@@ -203,53 +248,102 @@ def scan_u3_with_odds():
             elapsed = int(f["status"]["elapsed"] or 0)
             if elapsed > MAX_MINUTE:
                 continue
-            if fid in signaled_ids:
-                continue
 
             gh, ga = g["home"] or 0, g["away"] or 0
-            if (gh + ga) != 0:
-                continue  # нужно 0-0
+            total = gh + ga
 
-            odds_u3 = get_under3_odds(fid)
-            if odds_u3 is None:
-                log.info(f"fixture={fid} нет кэфа U3 → пропуск")
-                continue
-            if odds_u3 < ODDS_MIN_U3:
-                log.info(f"fixture={fid} кэф {odds_u3:.2f} < {ODDS_MIN_U3} → пропуск")
-                continue
+            # ---------- OVER-20 (2/3 гола) ----------
+            if STRAT_OVER_20 and total in (2, 3):
+                key_over = f"{fid}-OVER"
+                if key_over not in signaled_ids:
+                    line = LINE_O3 if total == 2 else LINE_O4
+                    if ODDS_ENABLED_O:
+                        odds = get_over_odds(fid, line)
+                        if odds is None:
+                            log.info("OVER: fixture=%s line=%.0f нет кэфа → пропуск", fid, line)
+                        elif not (ODDS_MIN_O <= odds <= ODDS_MAX_O):
+                            log.info("OVER: fixture=%s odds %.2f вне [%s,%s] → пропуск", fid, odds, ODDS_MIN_O, ODDS_MAX_O)
+                        else:
+                            rec = {
+                                "fixture_id": fid, "ts_utc": datetime.utcnow().isoformat(),
+                                "home": t["home"]["name"], "away": t["away"]["name"],
+                                "league": L["name"], "country": L["country"],
+                                "minute": elapsed, "goals_home": gh, "goals_away": ga,
+                                "market": "over", "line": line, "odds": round(float(odds), 2),
+                            }
+                            signals.append(rec); signaled_ids.add(key_over); save_state()
+                            send(
+                                "⚪ *Сигнал (OVER)*\n"
+                                f"🏆 {rec['country']} — {rec['league']}\n"
+                                f"{rec['home']} {gh} — {ga} {rec['away']}\n"
+                                f"⏱ {elapsed}'  |  *ТБ {line:.0f}*  |  кэф: *{rec['odds']:.2f}*\n"
+                                "─────────────"
+                            )
+                    else:
+                        rec = {
+                            "fixture_id": fid, "ts_utc": datetime.utcnow().isoformat(),
+                            "home": t["home"]["name"], "away": t["away"]["name"],
+                            "league": L["name"], "country": L["country"],
+                            "minute": elapsed, "goals_home": gh, "goals_away": ga,
+                            "market": "over", "line": line, "odds": "n/a",
+                        }
+                        signals.append(rec); signaled_ids.add(key_over); save_state()
+                        send(
+                            "⚪ *Сигнал (OVER)*\n"
+                            f"🏆 {rec['country']} — {rec['league']}\n"
+                            f"{rec['home']} {gh} — {ga} {rec['away']}\n"
+                            f"⏱ {elapsed}'  |  *ТБ {line:.0f}*\n"
+                            "─────────────"
+                        )
 
-            rec = {
-                "fixture_id": fid,
-                "ts_utc": datetime.utcnow().isoformat(),
-                "home": t["home"]["name"], "away": t["away"]["name"],
-                "league": L["name"], "country": L["country"],
-                "minute": elapsed, "goals_home": gh, "goals_away": ga,
-                "market": "under", "line": LINE_U3, "odds": round(float(odds_u3), 2),
-            }
-            signals.append(rec)
-            signaled_ids.add(fid)
-            save_state()
-
-            send(
-                "⚪ *Сигнал (U3 новая стратегия)*\n"
-                f"🏆 {rec['country']} — {rec['league']}\n"
-                f"{rec['home']} {gh} — {ga} {rec['away']}\n"
-                f"⏱ {elapsed}'  |  *ТМ {LINE_U3}*  |  кэф: *{rec['odds']:.2f}*\n"
-                "─────────────"
-            )
-            log.info("Signal U3 sent: fid=%s  %s-%s  min=%d  U3@%.2f",
-                     fid, rec['home'], rec['away'], elapsed, rec['odds'])
+            # ---------- UNDER-20 (0–0 и U3 >= 1.60) ----------
+            if STRAT_UNDER_20 and total == 0:
+                key_under = f"{fid}-UNDER"
+                if key_under not in signaled_ids:
+                    if ODDS_ENABLED_U:
+                        u3 = get_under3_odds(fid)
+                        if u3 is None:
+                            log.info("UNDER: fixture=%s нет кэфа U3 → пропуск", fid)
+                        elif u3 < ODDS_MIN_U3:
+                            log.info("UNDER: fixture=%s кэф %.2f < %.2f → пропуск", fid, u3, ODDS_MIN_U3)
+                        else:
+                            rec = {
+                                "fixture_id": fid, "ts_utc": datetime.utcnow().isoformat(),
+                                "home": t["home"]["name"], "away": t["away"]["name"],
+                                "league": L["name"], "country": L["country"],
+                                "minute": elapsed, "goals_home": gh, "goals_away": ga,
+                                "market": "under", "line": LINE_U3, "odds": round(float(u3), 2),
+                            }
+                            signals.append(rec); signaled_ids.add(key_under); save_state()
+                            send(
+                                "⚪ *Сигнал (UNDER)*\n"
+                                f"🏆 {rec['country']} — {rec['league']}\n"
+                                f"{rec['home']} {gh} — {ga} {rec['away']}\n"
+                                f"⏱ {elapsed}'  |  *ТМ {LINE_U3:.0f}*  |  кэф: *{rec['odds']:.2f}*\n"
+                                "─────────────"
+                            )
+                    else:
+                        rec = {
+                            "fixture_id": fid, "ts_utc": datetime.utcnow().isoformat(),
+                            "home": t["home"]["name"], "away": t["away"]["name"],
+                            "league": L["name"], "country": L["country"],
+                            "minute": elapsed, "goals_home": gh, "goals_away": ga,
+                            "market": "under", "line": LINE_U3, "odds": "n/a",
+                        }
+                        signals.append(rec); signaled_ids.add(key_under); save_state()
+                        send(
+                            "⚪ *Сигнал (UNDER)*\n"
+                            f"🏆 {rec['country']} — {rec['league']}\n"
+                            f"{rec['home']} {gh} — {ga} {rec['away']}\n"
+                            f"⏱ {elapsed}'  |  *ТМ {LINE_U3:.0f}*\n"
+                            "─────────────"
+                        )
 
         except Exception as e:
-            log.error(f"scan_u3_with_odds item error: {e}")
+            log.error(f"scan_and_signal item error: {e}")
 
-# ============== Отчёты (с учётом ПУША на 3.0) =============
+# ===== Отчёты (ТМ3 — с учётом пуша) =====
 def summarize_period(items, title):
-    """
-    +1/0/−1 ед. прибыли:
-      - ТМ 3.0: win при тотале < 3, push при тотале == 3, loss при тотале > 3.
-      - (если позже добавишь другие рынки — аналогично можно учесть их правила)
-    """
     total = len(items)
     if total == 0:
         return f"{title}\nСегодня ставок не было."
@@ -265,40 +359,33 @@ def summarize_period(items, title):
 
         st, gh, ga = res
         tot = (gh or 0) + (ga or 0)
-        market = rec.get("market")
-        line = int(rec.get("line", 3))
+        market = rec["market"]
+        line = int(rec["line"])
         odds = rec.get("odds", "n/a")
 
         if market == "under" and line == 3:
             if tot < 3:
-                wins += 1
-                pnl = +STAKE_UNITS
-                lines_out.append(f"#{i:02d} ✅ +{pnl:.2f} | {rec['home']} {gh}-{ga} {rec['away']} | ТМ 3.0 @ {odds}")
+                wins += 1; pnl = +STAKE_UNITS; tag = "ТМ 3.0"
+                lines_out.append(f"#{i:02d} ✅ +{pnl:.2f} | {rec['home']} {gh}-{ga} {rec['away']} | {tag} @ {odds}")
             elif tot == 3:
-                pushes += 1
-                pnl = 0.0
-                lines_out.append(f"#{i:02d} ♻ {pnl:.2f} | {rec['home']} {gh}-{ga} {rec['away']} | ТМ 3.0 @ {odds}")
-            else:  # tot > 3
-                losses += 1
-                pnl = -STAKE_UNITS
-                lines_out.append(f"#{i:02d} ❌ {pnl:.2f} | {rec['home']} {gh}-{ga} {rec['away']} | ТМ 3.0 @ {odds}")
+                pushes += 1; pnl = 0.0; tag = "ТМ 3.0"
+                lines_out.append(f"#{i:02d} ♻ {pnl:.2f} | {rec['home']} {gh}-{ga} {rec['away']} | {tag} @ {odds}")
+            else:
+                losses += 1; pnl = -STAKE_UNITS; tag = "ТМ 3.0"
+                lines_out.append(f"#{i:02d} ❌ {pnl:.2f} | {rec['home']} {gh}-{ga} {rec['away']} | {tag} @ {odds}")
         else:
-            # на будущее, если появятся другие рынки
-            ok = tot < line if market == "under" else tot > line
+            ok = tot > line if market == "over" else tot < line
+            tag = f"ТБ {line}" if market == "over" else f"ТМ {line}"
             if ok:
-                wins += 1
-                pnl = +STAKE_UNITS
-                tag = f"ТМ {line}" if market == "under" else f"ТБ {line}"
+                wins += 1; pnl = +STAKE_UNITS
                 lines_out.append(f"#{i:02d} ✅ +{pnl:.2f} | {rec['home']} {gh}-{ga} {rec['away']} | {tag} @ {odds}")
             else:
-                losses += 1
-                pnl = -STAKE_UNITS
-                tag = f"ТМ {line}" if market == "under" else f"ТБ {line}"
+                losses += 1; pnl = -STAKE_UNITS
                 lines_out.append(f"#{i:02d} ❌ {pnl:.2f} | {rec['home']} {gh}-{ga} {rec['away']} | {tag} @ {odds}")
 
-    profit = wins*STAKE_UNITS - losses*STAKE_UNITS  # пуши по 0
-    played = wins + losses + pushes
-    pass_rate = int(round((wins / max(1, wins + losses)) * 100.0))  # успехи из решённых (без пушей)
+    profit = wins*STAKE_UNITS - losses*STAKE_UNITS
+    solved = wins + losses  # пуши не считаем в знаменатель
+    pass_rate = int(round(wins * 100.0 / max(1, solved)))
 
     head = [
         title,
@@ -310,33 +397,33 @@ def summarize_period(items, title):
     return "\n".join(head + lines_out)
 
 def daily_report():
-    tz = pytz.timezone(TIMEZONE)
+    tzloc = tz()
     today = now_local().date()
     day_items = []
     for r in signals:
-        ts = datetime.fromisoformat(r["ts_utc"]).replace(tzinfo=timezone.utc).astimezone(tz)
+        ts = datetime.fromisoformat(r["ts_utc"]).replace(tzinfo=timezone.utc).astimezone(tzloc)
         if ts.date() == today:
             day_items.append(r)
     send(summarize_period(day_items, "📅 *Дневной отчёт*"))
 
 def weekly_report():
-    tz = pytz.timezone(TIMEZONE)
+    tzloc = tz()
     today = now_local().date()
     start_of_week = today - timedelta(days=today.weekday())  # понедельник
     week_items = []
     for r in signals:
-        ts = datetime.fromisoformat(r["ts_utc"]).replace(tzinfo=timezone.utc).astimezone(tz)
+        ts = datetime.fromisoformat(r["ts_utc"]).replace(tzinfo=timezone.utc).astimezone(tzloc)
         if start_of_week <= ts.date() <= today:
             week_items.append(r)
     send(summarize_period(week_items, "🗓 *Недельный отчёт*"))
 
 def monthly_report():
-    tz = pytz.timezone(TIMEZONE)
+    tzloc = tz()
     today = now_local().date()
     start_of_month = today.replace(day=1)
     month_items = []
     for r in signals:
-        ts = datetime.fromisoformat(r["ts_utc"]).replace(tzinfo=timezone.utc).astimezone(tz)
+        ts = datetime.fromisoformat(r["ts_utc"]).replace(tzinfo=timezone.utc).astimezone(tzloc)
         if start_of_month <= ts.date() <= today:
             month_items.append(r)
     send(summarize_period(month_items, "📆 *Месячный отчёт*"))
@@ -344,39 +431,36 @@ def monthly_report():
 def is_last_day_of_month(d):
     return (d + timedelta(days=1)).day == 1
 
-# ============== RUN ======================================
+# ===== RUN =====
 if __name__ == "__main__":
     Thread(target=run_http, daemon=True).start()
     load_state()
 
     send("🚀 Бот запущен — новая версия!")
-    send(f"✅ Стратегия: до 20' счёт 0–0 → *ТМ {LINE_U3}*, кэф ≥ *{ODDS_MIN_U3:.2f}* (по odds API).\n"
-         f"Пуш на ровной 3.0 учитывается как ♻ 0.00 в отчётах.")
+    send("✅ Активное окно: 16:00–23:29 (PL), опрос каждые 5 минут. Отчёты — в 23:30.\n"
+         "Стратегии: OVER-20 (2/3 гола → ТБ3/4), UNDER-20 (0–0 → ТМ3, кэф ≥ 1.60).")
 
     while True:
         try:
-            # скан
-            scan_u3_with_odds()
-
-            # отчёты в 23:30 по Варшаве
             now = now_local()
+
+            # отчёты в 23:30
             if now.hour == 23 and now.minute == 30:
                 daily_report()
                 if now.weekday() == 6:           # воскресенье
                     weekly_report()
                 if is_last_day_of_month(now.date()):
                     monthly_report()
-                time.sleep(60)  # антидубль
+                time.sleep(60)  # антидубль минута
 
-            # расписание опроса
-            if POLL_ALIGN:
-                sleep_to_next_quarter()
+            # активное окно опроса: 16:00..23:29
+            if in_active_window(now):
+                scan_and_signal()
             else:
-                time.sleep(15 * 60)
+                log.info("Вне активного окна (%s), сплю...", now.strftime("%H:%M"))
+
+            time.sleep(POLL_SEC)
 
         except Exception as e:
             log.error(f"Main loop error: {e}")
-            if POLL_ALIGN:
-                sleep_to_next_quarter()
-            else:
-                time.sleep(15 * 60)
+            time.sleep(POLL_SEC)
