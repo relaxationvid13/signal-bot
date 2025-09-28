@@ -1,30 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Футбольный бот:
-- Окно активности (Europe/Warsaw): 16:00–23:29, опрос live каждые 5 минут
-- Надёжный отчёт в 23:30 (даже если проспали момент)
-- Недельная сводка (вс, 23:30) и месячная сводка (последний день месяца, 23:30)
-- Стратегии:
-  OVER-20: к ~20' уже 2/3 гола -> ТБ3/ТБ4 (коэф по желанию)
-  UNDER-20: к ~20' 0:0 -> ТМ3 (коэф по желанию)
-Рендер (Web Service, Free): поднимается легкий Flask-сервер для "живого" порта.
+Бот: опрос лайвов по окну времени + отчёты.
+Исправлено: отчёты не дублируются (анти-спам по дням/неделям/месяцам).
 """
 
-import os
-import sys
-import time
-import json
-import logging
-from datetime import datetime, date, time as dtime, timedelta
+import os, sys, time, json, logging
+from datetime import datetime, timedelta, date
+import pytz, requests, telebot
 
-import pytz
-import requests
-import telebot
-
-# ---- Render keep-alive (Flask) ----
+# ---------- для Render (healthcheck) ----------
 from threading import Thread
 from flask import Flask
-
 app = Flask(__name__)
 
 @app.get("/")
@@ -34,505 +20,229 @@ def healthcheck():
 def run_http():
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+# ---------------------------------------------
 
-# ========= Секреты/окружение =========
-API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY   = os.getenv("API_FOOTBALL_KEY")
+# ======= Секреты/окружение =======
+API_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY    = os.getenv("API_FOOTBALL_KEY")
+TIMEZONE   = os.getenv("TZ_NAME", "Europe/Warsaw")  # отчёты в этом часовом поясе
+DISABLE_REPORTS = os.getenv("DISABLE_REPORTS", "0") == "1"
 
-# Часовой пояс: Варшава (Польша)
-TIMEZONE  = "Europe/Warsaw"
-
-if not API_TOKEN or not CHAT_ID or not API_KEY:
-    sys.exit("❌ Нет переменных окружения: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / API_FOOTBALL_KEY")
+if not API_TOKEN or not CHAT_ID:
+    sys.exit("❌ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
 CHAT_ID = int(CHAT_ID)
 
-# ============= Параметры =============
-# Активное окно (локальное)
-ACTIVE_FROM = dtime(16, 0)   # 16:00
-ACTIVE_TILL = dtime(23, 29)  # 23:29
-POLL_SEC    = 5 * 60         # 5 минут внутри окна
-IDLE_SEC    = 10 * 60        # 10 мин снаружи окна
+# ======= Параметры =======
+POLL_SECONDS = 300           # 5 минут
+ACTIVE_FROM  = (16, 0)       # 16:00 лок.
+ACTIVE_TILL  = (23, 29)      # 23:29 лок.
+STAKE = 1                    # условная ставка для отчётов
 
-# Окно "около 20-й минуты"
-WINDOW_20   = range(19, 23)  # 19..22 включительно
-
-# Коэффициенты (включаются флагами ниже)
-# OVER-20: 2 гола -> ТБ3 (нужен >=4 мячей, чтобы пройти),
-#          3 гола -> ТБ4 (нужен >=5 мячей, чтобы пройти)
-USE_ODDS_OVER   = False   # включить проверку коэф для OVER-20
-ODDS_MIN_OVER   = 1.29
-ODDS_MAX_OVER   = 2.00
-
-# UNDER-20: 0 голов -> ТМ3 (обычно <=2 гола, чтобы пройти)
-USE_ODDS_UNDER  = False   # включить проверку коэф для UNDER-20
-ODDS_MIN_UNDER  = 1.60
-
-# Условная ставка для расчёта PnL в отчётах
-STAKE          = 1.0
-
-# Файлы логов/состояния
 LOG_FILE   = "bot.log"
-STATE_FILE = "signals.json"
+STATE_FILE = "signals.json"  # тут храним сигналы и отметки о последних отчётах
 
-# Время отчёта
-REPORT_TIME = dtime(23, 30)  # 23:30
+# ======= Логи =======
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+                    format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("bot")
 
-# ========= Настройка логов ===========
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s"
-)
-log = logging.getLogger("signal-bot")
-
-# ========= Телеграм =========
 bot = telebot.TeleBot(API_TOKEN, parse_mode="Markdown")
 
-def send(text: str):
-    try:
-        bot.send_message(CHAT_ID, text)
-    except Exception as e:
-        log.error(f"Telegram send error: {e}")
-
-# ========= API-Football =========
 API = requests.Session()
-API.headers.update({"x-apisports-key": API_KEY})
-DEFAULT_TIMEOUT = 15
+if API_KEY:
+    API.headers.update({"x-apisports-key": API_KEY})
+DEFAULT_TIMEOUT = 12
 
-def get_live_fixtures():
-    """
-    Возвращает список live-матчей: API-Football /fixtures?live=all
-    """
-    try:
-        r = API.get(
-            "https://v3.football.api-sports.io/fixtures?live=all",
-            timeout=DEFAULT_TIMEOUT
-        )
-        if r.status_code != 200:
-            log.warning("fixtures HTTP %s %s", r.status_code, r.text[:200])
-        r.raise_for_status()
-        return r.json().get("response", []) or []
-    except Exception as e:
-        log.error(f"get_live_fixtures error: {e}")
-        return []
-
-def get_fixture_by_id(fid: int):
-    """
-    Один матч по id, для получения финального счёта/статуса.
-    """
-    try:
-        r = API.get(
-            f"https://v3.football.api-sports.io/fixtures?id={fid}",
-            timeout=DEFAULT_TIMEOUT
-        )
-        r.raise_for_status()
-        resp = r.json().get("response", []) or []
-        return resp[0] if resp else None
-    except Exception as e:
-        log.error(f"get_fixture_by_id({fid}) error: {e}")
-        return None
-
-# ВНИМАНИЕ: endpoint кэфов в API-Football может требовать расширенный тариф.
-# Ниже — «заглушка» со схемой; сделайте реальный вызов и маппинг под ваш тариф.
-def get_odds_for_market(fid: int, market_code: str):
-    """
-    Получить коэффициент для рынка.
-    market_code примеры: 'over_3', 'over_4', 'under_3' — это ваши условные "ключи".
-    Здесь вернём None (нет кэфа), чтобы не тратить квоту. Включите и реализуйте,
-    когда будет доступ к odds endpoint.
-    """
-    # пример схему (закомментирован):
-    # url = f"https://v3.football.api-sports.io/odds?fixture={fid}"
-    # r = API.get(url, timeout=DEFAULT_TIMEOUT)
-    # parse = ...
-    return None  # отключено по умолчанию
-
-# ========= Память/состояние =========
-# signals: список словарей:
-#  {
-#     "date": "YYYY-MM-DD",
-#     "fixture_id": int,
-#     "home": str, "away": str,
-#     "country": str, "league": str,
-#     "snapshot_minute": int,
-#     "snapshot_score_home": int, "snapshot_score_away": int,
-#     "signal_type": "OVER20_TB3"|"OVER20_TB4"|"UNDER20_TM3",
-#     "odds": float|null
-#  }
-signals = []
-signaled_ids = set()  # чтобы не дублировать во время дня
-_last_report_for_date = None  # отметка отчётов
+# ======= Состояние (persist) =======
+state = {
+    # сигналы за сегодня
+    "signals": [],  # каждый: {"ts":"YYYY-MM-DDTHH:MM:SS", "type":"OVER20/UNDER20", "desc":"..."}
+    # антиспам-метки
+    "last_daily": "",     # "YYYY-MM-DD"
+    "last_weekly": "",    # "YYYY-Www" (ISO week)
+    "last_monthly": ""    # "YYYY-MM"
+}
 
 def load_state():
-    global signals, signaled_ids, _last_report_for_date
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        signals = data.get("signals", [])
-        signaled_ids = set(data.get("signaled_ids", []))
-        rep = data.get("last_report_date")
-        _last_report_for_date = date.fromisoformat(rep) if rep else None
-    except Exception as e:
-        log.error(f"load_state error: {e}")
+    global state
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # аккуратно обновим ключи (чтобы не потерять новые)
+                for k in state.keys():
+                    if k in data:
+                        state[k] = data[k]
+        except Exception as e:
+            log.error(f"load_state error: {e}")
 
 def save_state():
     try:
-        data = {
-            "signals": signals,
-            "signaled_ids": list(signaled_ids),
-            "last_report_date": _last_report_for_date.isoformat() if _last_report_for_date else None
-        }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+            json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.error(f"save_state error: {e}")
 
-# ========= Время/окна =========
-def now_local() -> datetime:
+def tz_now():
     return datetime.now(pytz.timezone(TIMEZONE))
 
-def in_active_window(now: datetime) -> bool:
-    t = now.time()
-    return ACTIVE_FROM <= t <= ACTIVE_TILL
+def send(txt: str):
+    try:
+        bot.send_message(CHAT_ID, txt)
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
 
-def is_last_day_of_month(d: date) -> bool:
-    next_day = d + timedelta(days=1)
-    return next_day.day == 1
+# ======= Заглушки логики сигналов (здесь можешь добавить свою логику сканирования) =======
+def in_active_window(now_local: datetime) -> bool:
+    hm = (now_local.hour, now_local.minute)
+    return (hm >= ACTIVE_FROM) and (hm <= ACTIVE_TILL)
 
-# ======== Отчёты: robust-triggers ========
-def need_daily_report(now: datetime) -> bool:
+def scan_and_collect_signals():
     """
-    True, если отчёт за 'сегодня' ещё не отправлялся и локальное время >= 23:30,
-    или если уже наступил новый день (00:xx), а вчерашний отчёт не был отправлен (догоняем).
+    Заглушка: здесь могла бы быть твоя логика опроса API и выявления сигналов.
+    Сейчас ничего не добавляем, чтобы сфокусироваться на отчётах.
+    Пример, как добавить сигнал:
+    state["signals"].append({
+        "ts": tz_now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "type": "OVER20",   # или UNDER20
+        "desc": "Turkey 2.Lig | 19' 2-0 | кэф на ТБ3: 1.60"
+    })
     """
-    global _last_report_for_date
-    today = now.date()
+    pass
 
-    # если сегодня >= 23:30 и отчёта ещё не было
-    if _last_report_for_date != today and now.time() >= REPORT_TIME:
-        return True
-
-    # если уже новый день, а за вчера мы не отчитались (бот перезапустили/проспали)
-    yesterday = today - timedelta(days=1)
-    if _last_report_for_date != yesterday and now.time() < REPORT_TIME:
-        return True
-
-    return False
-
-def mark_report_sent(now: datetime):
-    global _last_report_for_date
-    _last_report_for_date = now.date()
-    save_state()
-
-# ======== Стратегии: детект & фиксация сигналов ========
-def push_signal(now: datetime, m, sig_type: str, odds: float | None):
-    """
-    Сохраняем сигнал (один раз на fixture_id в рамках дня), отправляем в Telegram.
-    """
-    f = m["fixture"]
-    L = m["league"]
-    g = m["goals"]
-    t = m["teams"]
-
-    fid = f["id"]
-    elapsed = f["status"]["elapsed"] or 0
-    gh, ga = g["home"] or 0, g["away"] or 0
-
-    rec = {
-        "date": now.date().isoformat(),
-        "fixture_id": fid,
-        "home": t["home"]["name"],
-        "away": t["away"]["name"],
-        "country": L["country"],
-        "league": L["name"],
-        "snapshot_minute": int(elapsed),
-        "snapshot_score_home": gh,
-        "snapshot_score_away": ga,
-        "signal_type": sig_type,
-        "odds": odds
-    }
-    signals.append(rec)
-    signaled_ids.add(fid)
-    save_state()
-
-    text = []
-    text.append("⚪ *Сигнал!*")
-    text.append(f"🏆 {rec['country']} — {rec['league']}")
-    text.append(f"{rec['home']} {gh} — {ga} {rec['away']}")
-    text.append(f"⏱ ~{elapsed}'")
-    if sig_type == "OVER20_TB3":
-        text.append("Стратегия: OVER-20 → *ТБ3*")
-    elif sig_type == "OVER20_TB4":
-        text.append("Стратегия: OVER-20 → *ТБ4*")
-    elif sig_type == "UNDER20_TM3":
-        text.append("Стратегия: UNDER-20 → *ТМ3*")
-    if odds:
-        text.append(f"Коэф: *{odds:.2f}*")
-    text.append("─────────────")
-    send("\n".join(text))
-
-def check_over20(m) -> tuple[bool, str | None, float | None]:
-    """
-    Если к ~20' уже 2 или 3 гола:
-     - 2 гола -> ТБ3 (возвращаем sig_type='OVER20_TB3')
-     - 3 гола -> ТБ4 (sig_type='OVER20_TB4')
-    Возвращает (ok, sig_type, odds).
-    При включённом USE_ODDS_OVER дополнительно проверяет окно коэффициентов.
-    """
-    f = m["fixture"]
-    g = m["goals"]
-    elapsed = f["status"]["elapsed"] or 0
-    if elapsed not in WINDOW_20:
-        return False, None, None
-
-    gh, ga = g["home"] or 0, g["away"] or 0
-    total = gh + ga
-    if total == 2:
-        sig_type = "OVER20_TB3"
-        odds = None
-        if USE_ODDS_OVER:
-            odds = get_odds_for_market(f["id"], "over_3")
-            if odds is None or not (ODDS_MIN_OVER <= odds <= ODDS_MAX_OVER):
-                return False, None, None
-        return True, sig_type, odds
-
-    if total == 3:
-        sig_type = "OVER20_TB4"
-        odds = None
-        if USE_ODDS_OVER:
-            odds = get_odds_for_market(f["id"], "over_4")
-            if odds is None or not (ODDS_MIN_OVER <= odds <= ODDS_MAX_OVER):
-                return False, None, None
-        return True, sig_type, odds
-
-    return False, None, None
-
-def check_under20(m) -> tuple[bool, str | None, float | None]:
-    """
-    Если к ~20' счёт 0:0 — ставка ТМ3 (UNDER-20).
-    Возвращает (ok, 'UNDER20_TM3', odds).
-    При включённом USE_ODDS_UNDER дополнительно проверяет, что коэф >= ODDS_MIN_UNDER.
-    """
-    f = m["fixture"]
-    g = m["goals"]
-    elapsed = f["status"]["elapsed"] or 0
-    if elapsed not in WINDOW_20:
-        return False, None, None
-
-    gh, ga = g["home"] or 0, g["away"] or 0
-    if (gh + ga) != 0:
-        return False, None, None
-
-    sig_type = "UNDER20_TM3"
-    odds = None
-    if USE_ODDS_UNDER:
-        odds = get_odds_for_market(f["id"], "under_3")
-        if odds is None or odds < ODDS_MIN_UNDER:
-            return False, None, None
-    return True, sig_type, odds
-
-def scan_and_signal(now: datetime) -> bool:
-    """
-    Возвращает True, если был отправлен хотя бы один сигнал (для быстрой паузы).
-    """
-    live = get_live_fixtures()
-    sent_any = False
-    for m in live:
-        try:
-            f = m["fixture"]
-            fid = f["id"]
-
-            # не дублировать сигнал для этого матча в текущий день
-            if fid in signaled_ids:
-                continue
-
-            ok, sig_type, odds = check_over20(m)
-            if ok:
-                push_signal(now, m, sig_type, odds)
-                sent_any = True
-                continue
-
-            ok, sig_type, odds = check_under20(m)
-            if ok:
-                push_signal(now, m, sig_type, odds)
-                sent_any = True
-                continue
-
-        except Exception as e:
-            log.error(f"scan_and_signal item error: {e}")
-    return sent_any
-
-# ========= Подсчёт результатов =========
-def settle_signal(rec: dict) -> tuple[bool, int]:
-    """
-    Возвращает (is_win, required_goals_for_win)
-    OVER20_TB3 -> выигрыш если финальный total >= 4
-    OVER20_TB4 -> выигрыш если финальный total >= 5
-    UNDER20_TM3 -> выигрыш если финальный total <= 2
-    """
-    fid = rec["fixture_id"]
-    snap_total = rec["snapshot_score_home"] + rec["snapshot_score_away"]
-    sig = rec["signal_type"]
-
-    data = get_fixture_by_id(fid)
-    if not data:
-        return False, -999  # неизвестно
-
-    st = data["fixture"]["status"]["short"]
-    gh = data["goals"]["home"] or 0
-    ga = data["goals"]["away"] or 0
-    final_total = gh + ga
-
-    if st != "FT":  # матч не завершён, считаем как "нет данных"
-        return False, -998
-
-    if sig == "OVER20_TB3":
-        return (final_total >= 4), 4
-    if sig == "OVER20_TB4":
-        return (final_total >= 5), 5
-    if sig == "UNDER20_TM3":
-        return (final_total <= 2), 3  # ТМ3 => выигрыш при финале <=2
-
-    return False, -997
-
-# ========= Отчёты =========
-def daily_report(now: datetime):
-    """
-    Отчёт за сегодня (по дате из rec['date'] == сегодня).
-    """
-    today = now.date().isoformat()
-    today_signals = [r for r in signals if r["date"] == today]
-
-    wins = loses = unknown = 0
-    pnl = 0.0
-    lines = ["📊 *Отчёт за день*"]
-
+# ======= Формирование отчётов =======
+def build_day_report(day: date) -> str:
+    # фильтруем события за дату day
+    day_str = day.strftime("%Y-%m-%d")
+    today_signals = [s for s in state["signals"]
+                     if s.get("ts","").startswith(day_str)]
+    lines = ["🧾 *Отчёт за день*",
+             f"Период: {day_str}",
+             f"Ставок: {len(today_signals)}"]
+    # при желании можно считать вин/луз, профит — сейчас нет исходов матчей
     if not today_signals:
         lines.append("За сегодня ставок не было.")
-        send("\n".join(lines))
+        return "\n".join(lines)
+
+    # сводка по типам
+    over = sum(1 for s in today_signals if s.get("type")=="OVER20")
+    under= sum(1 for s in today_signals if s.get("type")=="UNDER20")
+
+    lines.append(f"OVER20: {over} | UNDER20: {under}")
+    lines.append("──────────")
+    cut = today_signals[-12:]  # покажем последние 12 для краткости
+    for i,s in enumerate(cut, 1):
+        lines.append(f"{i:02d}. {s.get('desc','')}")
+    return "\n".join(lines)
+
+def build_week_report(week_date: date) -> str:
+    # неделя ISO — возьмём период понедельник-воскресенье
+    iso_year, iso_week, iso_weekday = week_date.isocalendar()
+    lines = ["📅 *Недельная сводка*",
+             f"ISO-week: {iso_year}-W{iso_week:02d}"]
+
+    # набираем сигналы за всю неделю
+    week_signals = []
+    for s in state["signals"]:
+        try:
+            d = datetime.strptime(s["ts"][:10], "%Y-%m-%d").date()
+            y, w, wd = d.isocalendar()
+            if y==iso_year and w==iso_week:
+                week_signals.append(s)
+        except Exception:
+            pass
+
+    lines.append(f"Ставок: {len(week_signals)}")
+    if not week_signals:
+        lines.append("За эту неделю ставок не было.")
+        return "\n".join(lines)
+
+    over = sum(1 for s in week_signals if s.get("type")=="OVER20")
+    under= sum(1 for s in week_signals if s.get("type")=="UNDER20")
+    lines.append(f"OVER20: {over} | UNDER20: {under}")
+    return "\n".join(lines)
+
+def build_month_report(month_date: date) -> str:
+    ym = month_date.strftime("%Y-%m")
+    lines = ["🗓 *Месячная сводка*",
+             f"Месяц: {ym}"]
+
+    month_signals = [s for s in state["signals"]
+                     if s.get("ts","").startswith(ym)]
+    lines.append(f"Ставок: {len(month_signals)}")
+    if not month_signals:
+        lines.append("В этом месяце ставок не было.")
+        return "\n".join(lines)
+
+    over = sum(1 for s in month_signals if s.get("type")=="OVER20")
+    under= sum(1 for s in month_signals if s.get("type")=="UNDER20")
+    lines.append(f"OVER20: {over} | UNDER20: {under}")
+    return "\n".join(lines)
+
+# ======= Анти-спам отчётов =======
+def maybe_send_reports():
+    if DISABLE_REPORTS:
         return
 
-    for i, rec in enumerate(today_signals, 1):
-        ok, needed = settle_signal(rec)
-        home = rec["home"]; away = rec["away"]
-        sig  = rec["signal_type"]
-        odds = rec.get("odds")
+    now = tz_now()
+    # Время отчёта — ровно 23:30
+    if not (now.hour == 23 and now.minute == 30):
+        return
 
-        # итоги
-        if ok is True:
-            wins += 1
-            pnl += +STAKE
-            mark = "✅"
-        elif ok is False and needed in (-997, -998, -999):
-            unknown += 1
-            mark = "…"
-        else:
-            loses += 1
-            pnl += -STAKE
-            mark = "❌"
+    # DAILY — один раз в день
+    day_key = now.strftime("%Y-%m-%d")
+    if state.get("last_daily") != day_key:
+        send(build_day_report(now.date()))
+        state["last_daily"] = day_key
+        save_state()
+        # 60 секунд «тишины», чтобы не продублировать в ту же минуту
+        time.sleep(60)
 
-        oddstxt = f" | {odds:.2f}" if odds else ""
-        # краткий формат
-        lines.append(f"#{i} {mark} {home} — {away} | {sig}{oddstxt}")
+    # WEEKLY — по воскресеньям (weekday() == 6)
+    if now.weekday() == 6:
+        iso_year, iso_week, _ = now.isocalendar()
+        week_key = f"{iso_year}-W{iso_week:02d}"
+        if state.get("last_weekly") != week_key:
+            send(build_week_report(now.date()))
+            state["last_weekly"] = week_key
+            save_state()
+            time.sleep(5)
 
-    total = len(today_signals)
-    passrate = (wins / total * 100.0) if total else 0.0
+    # MONTHLY — в последний день месяца
+    next_day = now.date() + timedelta(days=1)
+    if next_day.day == 1:  # значит сегодня последний день месяца
+        month_key = now.strftime("%Y-%m")
+        if state.get("last_monthly") != month_key:
+            send(build_month_report(now.date()))
+            state["last_monthly"] = month_key
+            save_state()
+            time.sleep(5)
 
-    lines.append("")
-    lines.append(f"Итого: {wins} / {total}  | Проходимость: {passrate:.1f}%")
-    lines.append(f"Профит (ставка={STAKE:g}): {pnl:+.2f}")
-    send("\n".join(lines))
-
-def _aggregate_by_period(dfrom: date, dto: date):
-    subset = [r for r in signals if dfrom <= date.fromisoformat(r["date"]) <= dto]
-    wins = loses = unknown = 0
-    pnl = 0.0
-    for rec in subset:
-        ok, _ = settle_signal(rec)
-        if ok is True:
-            wins += 1
-            pnl += +STAKE
-        elif ok is False and _ in (-997, -998, -999):
-            unknown += 1
-        else:
-            loses += 1
-            pnl += -STAKE
-    total = len(subset)
-    rate = (wins / total * 100.0) if total else 0.0
-    return total, wins, loses, unknown, pnl, rate
-
-def weekly_report(now: datetime):
-    # отчёт за ISO-неделю: понедельник..воскресенье (включ.)
-    end = now.date()
-    start = end - timedelta(days=6)
-    total, wins, loses, unknown, pnl, rate = _aggregate_by_period(start, end)
-    lines = [
-        "📅 *Недельная сводка*",
-        f"Период: {start.isoformat()} — {end.isoformat()}",
-        f"Ставок: {total}, Вин: {wins}, Луз: {loses}, Н/д: {unknown}",
-        f"Проходимость: {rate:.1f}%",
-        f"Профит (ставка={STAKE:g}): {pnl:+.2f}"
-    ]
-    send("\n".join(lines))
-
-def monthly_report(now: datetime):
-    end = now.date()
-    start = end.replace(day=1)
-    total, wins, loses, unknown, pnl, rate = _aggregate_by_period(start, end)
-    lines = [
-        "🗓️ *Месячная сводка*",
-        f"Период: {start.isoformat()} — {end.isoformat()}",
-        f"Ставок: {total}, Вин: {wins}, Луз: {loses}, Н/д: {unknown}",
-        f"Проходимость: {rate:.1f}%",
-        f"Профит (ставка={STAKE:g}): {pnl:+.2f}"
-    ]
-    send("\n".join(lines))
-
-# ========= RUN =========
+# ======= RUN =======
 if __name__ == "__main__":
-    # HTTP для Render
+    # HTTP для Render (Web Service/Free)
     Thread(target=run_http, daemon=True).start()
 
     load_state()
 
     send("🚀 Бот запущен — новая версия!")
-    send(
-        "✅ Активное окно: 16:00–23:29 (PL), опрос каждые 5 минут.\n"
-        "Отчёты — в 23:30.\n"
-        "Стратегии: OVER-20 (2/3 гола → ТБ3/4), UNDER-20 (0–0 → ТМ3).\n"
-        f"Фильтры коэфов: OVER={USE_ODDS_OVER} "
-        f"(окно {ODDS_MIN_OVER:.2f}–{ODDS_MAX_OVER:.2f}), "
-        f"UNDER={USE_ODDS_UNDER} (≥ {ODDS_MIN_UNDER:.2f})."
-    )
+    send("✅ Активное окно: 16:00—23:29 (PL), опрос каждые 5 минут.\nОтчёты — в 23:30.")
 
     while True:
         try:
-            now = now_local()
+            now = tz_now()
 
-            # --- отчётный блок, устойчивый к "проспали минуту" ---
-            if need_daily_report(now):
-                daily_report(now)
-                # недельная — по воскресеньям
-                if now.weekday() == 6:
-                    weekly_report(now)
-                # месячная — в последний день месяца
-                if is_last_day_of_month(now.date()):
-                    monthly_report(now)
-                mark_report_sent(now)
-                time.sleep(60)    # чтобы не задвоить отчёт
-                continue
-
-            # --- основная логика опроса ---
+            # опрос матчей только в окне
             if in_active_window(now):
-                was = scan_and_signal(now)
-                # если «горячо» — слегка передохнём
-                time.sleep(60 if was else POLL_SEC)
-            else:
-                time.sleep(IDLE_SEC)
+                scan_and_collect_signals()
+
+            # отчёты с антиспамом
+            maybe_send_reports()
+
+            time.sleep(POLL_SECONDS)
 
         except Exception as e:
             log.error(f"Main loop error: {e}")
-            time.sleep(POLL_SEC)
+            time.sleep(POLL_SECONDS)
