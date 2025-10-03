@@ -48,7 +48,7 @@ FORM_LAST = 2
 FORM_REQUIRE_TB = 1   # «в последних 2 — хотя бы 1 TB2.5»
 
 # График
-SCAN_HH, SCAN_MM = 8, 0     # 08:00
+SCAN_HH, SCAN_MM = 16, 26     # 16:26
 DAILY_HH, DAILY_MM = 23, 30
 WEEKLY_HH, WEEKLY_MM = 23, 50
 MONTHLY_HH, MONTHLY_MM = 23, 50
