@@ -1,87 +1,79 @@
 # -*- coding: utf-8 -*-
 """
-Pre-match signals bot for Render (sleep-resilient) + Telegram commands:
-- Автозадачи (как раньше): скан ≥ 08:00; отчёт ≥ 23:30; неделя — вс ≥ 23:50; месяц — в посл. день ≥ 23:50.
-- Команды в чате:
-  /scan     — принудительный дневной прогон
-  /report   — дневной отчёт
-  /weekly   — недельный отчёт
-  /monthly  — месячный отчёт
-  /status   — показать последние отметки
-  /help     — список команд
+Предматч-бот (Render-ready, Web Service Free).
+Стратегия:
+  ✅ Последний очный матч — ТБ 2.5
+  ✅ Два последних матча КАЖДОЙ команды — ТБ 2.5
+  ✅ (Опционально) фильтр по кэфу на ТБ2.5 в диапазоне [ODDS_MIN, ODDS_MAX]
+
+Расписание (Europe/Warsaw):
+  - 08:00 — скан карточки матчей на сегодня и отправка сигналов
+  - 23:30 — дневной отчёт
+  - Вс 23:50 — недельный отчёт
+  - Последний день месяца 23:50 — месячный отчёт
 """
 
-import os
-import json
-import time
-import pytz
-import logging
-import threading
+import os, sys, time, json, logging, math
 from datetime import datetime, timedelta, date
-from threading import Thread, Lock
+from threading import Thread
 
+import pytz
 import requests
 import telebot
-from telebot import types
 from flask import Flask
 
-# ===================== Settings & Secrets =====================
-
-API_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY     = os.getenv("API_FOOTBALL_KEY")
-TIMEZONE    = os.getenv("TZ", "Europe/Warsaw")
-
-LEAGUE_FILTER = os.getenv("LEAGUE_IDS", "").strip()
-LEAGUE_SET = set(s.strip() for s in LEAGUE_FILTER.split(",") if s.strip())
-
-REQUEST_TIMEOUT = 15
-STORAGE_FILE    = "signals.json"
-LOG_FILE        = "bot.log"
-
-if not API_TOKEN or not CHAT_ID_RAW or not API_KEY:
-    raise SystemExit("❌ Need TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / API_FOOTBALL_KEY")
-
-try:
-    CHAT_ID = int(CHAT_ID_RAW)
-except Exception:
-    CHAT_ID = CHAT_ID_RAW
-
-# ===================== Logging =====================
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-)
-log = logging.getLogger("prematch-bot")
-
-# ===================== Telegram & HTTP session =====================
-
-bot = telebot.TeleBot(API_TOKEN, parse_mode="HTML")
-
-API = requests.Session()
-API.headers.update({"x-apisports-key": API_KEY})
-
-# ===================== Flask (Render Web Service) =====================
-
+# ----------------- Mini web (Render port binding) -----------------
 app = Flask(__name__)
-
 @app.get("/")
-def healthcheck():
-    return "ok"
-
+def health():
+    return "ok"  # Render needs an open port to keep process alive
 def run_http():
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+# ------------------------------------------------------------------
 
-# ===================== Helpers =====================
+# ================= Конфигурация =================
+API_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY     = os.getenv("API_FOOTBALL_KEY")
+TIMEZONE    = os.getenv("TZ", "Europe/Warsaw")
 
-def tz():
-    return pytz.timezone(TIMEZONE)
+if not API_TOKEN or not CHAT_ID or not API_KEY:
+    sys.exit("❌ env vars required: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / API_FOOTBALL_KEY")
+
+CHAT_ID = int(CHAT_ID)
+
+# Порог кэфов (опционально). Если оставить None — фильтр по кэфу отключён.
+def _get_float_or_none(name, default=None):
+    v = os.getenv(name, "")
+    try:
+        return float(v) if v else default
+    except Exception:
+        return default
+
+ODDS_MIN = _get_float_or_none("ODDS_MIN", None)  # напр. 1.29
+ODDS_MAX = _get_float_or_none("ODDS_MAX", None)  # напр. 2.00
+
+# Время цикла бота: держим невысоким, он сам проверяет «часы»
+LOOP_SECONDS = 60
+
+# Файлы состояния/логов
+LOG_FILE   = "bot.log"
+STATE_FILE = "signals.json"
+
+# ================= Логи =================
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+log = logging.getLogger("prematch-bot")
+
+# ================= Telegram =================
+bot = telebot.TeleBot(API_TOKEN, parse_mode="Markdown")
 
 def now_local():
-    return datetime.now(tz())
+    return datetime.now(pytz.timezone(TIMEZONE))
 
 def send(msg: str):
     try:
@@ -89,481 +81,330 @@ def send(msg: str):
     except Exception as e:
         log.error(f"Telegram send error: {e}")
 
-def default_store():
-    return {
-        "meta": {
-            "last_scan_date": None,            # "YYYY-MM-DD"
-            "last_daily_report_date": None,    # "YYYY-MM-DD"
-            "last_weekly_yrwk": None,          # "YYYY-WW"
-            "last_monthly_yrmo": None          # "YYYY-MM"
-        },
-        "days": {}  # "YYYY-MM-DD": [ {fixture,...} ]
-    }
-
-def load_store():
-    if not os.path.exists(STORAGE_FILE):
-        return default_store()
-    try:
-        with open(STORAGE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if "meta" not in data:
-            data["meta"] = default_store()["meta"]
-        if "days" not in data:
-            data["days"] = {}
-        return data
-    except Exception as e:
-        log.error(f"load_store error: {e}")
-        return default_store()
-
-def save_store(data):
-    try:
-        with open(STORAGE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.error(f"save_store error: {e}")
+# ================= API-Football =================
+API = requests.Session()
+API.headers.update({"x-apisports-key": API_KEY})
+DEFAULT_TIMEOUT = 15
 
 def api_get(url, params=None):
     try:
-        r = API.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
+        r = API.get(url, params=params or {}, timeout=DEFAULT_TIMEOUT)
+        if r.status_code != 200:
+            log.warning("HTTP %s %s", r.status_code, r.text[:160])
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        log.error(f"GET {url} error: {e}")
-        return {}
+        log.error(f"api_get error: {e}")
+        return None
 
-def total_goals_of_fixture(m):
+def goals_total_from_fixture(m):
+    """ Возвращает (home_goals, away_goals, total) из объекта матча API-Football. """
     try:
         gh = m["goals"]["home"] or 0
         ga = m["goals"]["away"] or 0
-        return gh, ga, (gh + ga)
+        return gh, ga, gh + ga
     except Exception:
-        return 0, 0, 0
+        return 0, 0, None
 
-def is_finished_status(short):
-    return short in ("FT", "AET", "PEN")
+def is_tb25_total(total):
+    return (total is not None) and (total >= 3)
 
-# ===================== Strategy checks =====================
+def odds_over25_for_fixture(fixture_id):
+    """
+    Возвращает кэф на ТБ2.5 (float) или None.
+    Ищем market "Over/Under", line "2.5" / outcome "Over".
+    """
+    url = "https://v3.football.api-sports.io/odds"
+    data = api_get(url, {"fixture": fixture_id})
+    if not data: 
+        return None
+    resp = data.get("response", []) or []
+    for book in resp:
+        for market in book.get("bookmakers", []):
+            for mark in market.get("bets", []):
+                if (mark.get("name", "").lower() in ("over/under", "ou", "over under")):
+                    for v in mark.get("values", []):
+                        ln = v.get("value", "").replace(" ", "")
+                        if ln in ("Over2.5", "2.5", "Over 2.5"):
+                            try:
+                                return float(v.get("odd"))
+                            except Exception:
+                                continue
+    return None
 
-def h2h_three_all_over3(home_id, away_id):
+def last_h2h_is_tb25(home_id, away_id):
+    """
+    Проверяем ПОСЛЕДНИЙ очный матч => ТБ2.5?
+    """
     url = "https://v3.football.api-sports.io/fixtures/headtohead"
-    data = api_get(url, {"h2h": f"{home_id}-{away_id}", "last": 3})
-    resp = data.get("response") or []
-    if len(resp) < 3:
+    data = api_get(url, {"h2h": f"{home_id}-{away_id}", "last": 1})
+    if not data: 
+        return False
+    resp = data.get("response", []) or []
+    if not resp:
+        return False
+    gh, ga, tot = goals_total_from_fixture(resp[0])
+    return is_tb25_total(tot)
+
+def last_k_is_tb25_for_team(team_id, k=2):
+    """
+    Проверяем: у команды последние k матчей — ТБ2.5?
+    """
+    url = "https://v3.football.api-sports.io/fixtures"
+    data = api_get(url, {"team": team_id, "last": k})
+    if not data:
+        return False
+    resp = data.get("response", []) or []
+    if len(resp) < k:
         return False
     for m in resp:
-        _, _, tot = total_goals_of_fixture(m)
-        if tot < 3:
+        gh, ga, tot = goals_total_from_fixture(m)
+        if not is_tb25_total(tot):
             return False
     return True
 
-def team_last3_at_least2_over3(team_id):
-    url = "https://v3.football.api-sports.io/fixtures"
-    data = api_get(url, {"team": team_id, "last": 3})
-    resp = data.get("response") or []
-    if len(resp) < 3:
-        return False
-    count_over3 = 0
-    for m in resp:
-        _, _, tot = total_goals_of_fixture(m)
-        if tot >= 3:
-            count_over3 += 1
-    return count_over3 >= 2
+# ================= Состояние (сигналы/ставки) =================
+STATE = {
+    "signals": [],        # список сигналов за сегодня
+    "history": []         # архив (для недели/месяца)
+}
 
-def try_get_odds_over25(fixture_id):
-    try:
-        url = "https://v3.football.api-sports.io/odds"
-        data = api_get(url, {"fixture": fixture_id})
-        resp = data.get("response") or []
-        for item in resp:
-            for book in item.get("bookmakers", []):
-                for bet in book.get("bets", []):
-                    name = (bet.get("name") or "").lower()
-                    if "over/under" in name:
-                        for val in bet.get("values", []):
-                            v = (val.get("value") or "").lower()
-                            if v in ("over 2.5", "o 2.5", "over2.5"):
-                                odd = val.get("odd")
-                                if odd:
-                                    return odd
-        return "n/a"
-    except Exception as e:
-        log.error(f"odds error for fixture {fixture_id}: {e}")
-        return "n/a"
-
-# ===================== Daily scan =====================
-
-def scan_today():
-    today_str = now_local().strftime("%Y-%m-%d")
-    send(f"🛰️ Старт дневного прогона ({today_str}).")
-    log.info("Daily scan started.")
-
-    url = "https://v3.football.api-sports.io/fixtures"
-    fixtures_data = api_get(url, {"date": today_str})
-    fixtures = fixtures_data.get("response") or []
-
-    if LEAGUE_SET:
-        fixtures = [m for m in fixtures if str(m["league"]["id"]) in LEAGUE_SET]
-
-    store = load_store()
-    day_list = store["days"].setdefault(today_str, [])
-
-    signals_sent = 0
-
-    for m in fixtures:
+def load_state():
+    global STATE
+    if os.path.exists(STATE_FILE):
         try:
-            f      = m["fixture"]
-            league = m["league"]
-            teams  = m["teams"]
-            fid    = f["id"]
-            home_id = teams["home"]["id"]
-            away_id = teams["away"]["id"]
-            home_name = teams["home"]["name"]
-            away_name = teams["away"]["name"]
-            league_name = league["country"] + " — " + league["name"]
-
-            if any(x.get("fixture_id")==fid for x in day_list):
-                continue
-
-            if not h2h_three_all_over3(home_id, away_id):
-                continue
-            if not team_last3_at_least2_over3(home_id):
-                continue
-            if not team_last3_at_least2_over3(away_id):
-                continue
-
-            odds = try_get_odds_over25(fid)
-
-            msg = (
-                "⚽ <b>Сигнал (прематч)</b>\n"
-                f"🏆 {league_name}\n"
-                f"{home_name} — {away_name}\n"
-                f"🎯 Рекомендуем: <b>ТБ 2.5</b>\n"
-                f"💹 Коэф: <b>{odds}</b>\n"
-            )
-            send(msg)
-
-            day_list.append({
-                "fixture_id": fid,
-                "home": home_name,
-                "away": away_name,
-                "league": league_name,
-                "odds": odds,
-                "time": f["date"],
-                "result_checked": False,
-            })
-            signals_sent += 1
-            save_store(store)
-            time.sleep(0.3)
-
+            STATE = json.load(open(STATE_FILE, "r", encoding="utf-8"))
         except Exception as e:
-            log.error(f"scan item error: {e}")
+            log.error(f"load_state: {e}")
 
-    send(f"✅ Прогон завершён. Найдено матчей: {signals_sent}.")
-    log.info("Daily scan finished: %s", signals_sent)
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"save_state: {e}")
 
-# ===================== Reports =====================
+def reset_today():
+    """Начать новый день: текущие сигналы -> историю, очистить список."""
+    today_str = now_local().strftime("%Y-%m-%d")
+    if STATE.get("signals"):
+        STATE["history"].extend(STATE["signals"])
+    STATE["signals"] = []
+    save_state()
 
-def resolve_fixture_result(fid):
-    url = "https://v3.football.api-sports.io/fixtures"
-    data = api_get(url, {"id": fid})
-    resp = data.get("response") or []
-    if not resp:
-        return None
-    m = resp[0]
-    st = m["fixture"]["status"]["short"]
-    gh, ga, tot = total_goals_of_fixture(m)
-    return {"status": st, "home_goals": gh, "away_goals": ga, "total": tot}
-
-def daily_report():
-    d_str = now_local().strftime("%Y-%m-%d")
-    store = load_store()
-    day_list = store["days"].get(d_str, [])
-
-    if not day_list:
-        send("📊 Отчёт за день\nСегодня сигналов не было.")
-        return
-
-    wins = losses = pend = 0
-    lines = ["📊 <b>Отчёт за день</b>"]
-    pnl = 0.0
-
-    for rec in day_list:
-        fid = rec["fixture_id"]
-        res = resolve_fixture_result(fid)
-        if not res:
-            pend += 1
-            lines.append(f"{rec['home']} — {rec['away']} | результат: n/a")
-            continue
-
-        st = res["status"]
-        tot = res["total"]
-        if is_finished_status(st):
-            if tot >= 3:
-                wins += 1
-                pnl += 1.0
-                mark = "✅"
-            else:
-                losses += 1
-                pnl -= 1.0
-                mark = "❌"
-            lines.append(f"{rec['home']} {res['home_goals']}-{res['away_goals']} {rec['away']} | {mark}")
-            rec["result_checked"] = True
-            rec["final_total"] = tot
+# ================= Формирование отчётов =================
+def summarize(items):
+    # Простейшая "прибыль": считаем +1 если FT total >= 3, иначе -1 (модель для фиксации результата)
+    win = lose = draw = 0
+    for it in items:
+        res = it.get("result")
+        if res == "WIN":
+            win += 1
+        elif res == "LOSE":
+            lose += 1
         else:
-            pend += 1
-            lines.append(f"{rec['home']} — {rec['away']} | статус: {st}")
+            draw += 1
+    played = win + lose + draw
+    streak = f"Ставок: {played}, Вин: {win}, Луз: {lose}, Н/Д: {draw}\n"
+    return streak
 
-    lines.append("─────────────")
-    lines.append(f"Сигналов: {len(day_list)} | ✅ {wins}  ❌ {losses}  ⏳ {pend}")
-    lines.append(f"Итог PnL: {pnl:+.2f} (ставка=1)")
+def finalize_results_for_day(day_items):
+    """Обновляем результаты сигналов (WIN/LOSE) на основании финального счёта."""
+    url = "https://v3.football.api-sports.io/fixtures"
+    changed = 0
+    for it in day_items:
+        if it.get("result") in ("WIN", "LOSE"):
+            continue
+        fid = it.get("fixture_id")
+        data = api_get(url, {"id": fid}) or {}
+        resp = (data.get("response") or [])
+        if not resp:
+            continue
+        st = resp[0]["fixture"]["status"]["short"]
+        gh, ga, tot = goals_total_from_fixture(resp[0])
+        if st in ("FT", "AET", "PEN"):
+            it["final_total"] = tot
+            it["result"] = "WIN" if is_tb25_total(tot) else "LOSE"
+            changed += 1
+    if changed:
+        save_state()
 
-    save_store(store)
-    send("\n".join(lines))
+def day_report():
+    # перед отчётом — обновляем результаты сегодняшних сигналов
+    finalize_results_for_day(STATE.get("signals", []))
+    txt = ["📊 *Отчёт за день*"]
+    today_str = now_local().strftime("%Y-%m-%d")
+    today_signals = [s for s in STATE.get("signals", []) if s.get("date") == today_str]
+    if not today_signals:
+        txt.append("За сегодня сигналов не было.")
+    else:
+        txt.append(summarize(today_signals))
+        for i, s in enumerate(today_signals, 1):
+            line = (
+                f"{i}. {s['home']}–{s['away']} | "
+                f"условие: H2H ТБ2.5 + 2/2 ТБ2.5 у обеих | "
+                f"кэф ТБ2.5: {s.get('odds_over25','–')}"
+            )
+            res = s.get("result")
+            if res:
+                line += f" | итог: {s.get('final_total','?')} ({'✅' if res=='WIN' else '❌'})"
+            txt.append(line)
+    send("\n".join(txt))
 
 def weekly_report():
-    today = now_local().date()
-    week_ago = today - timedelta(days=7)
-
-    store = load_store()
-    wins = losses = total = 0
-    pnl = 0.0
-
-    for d_str, recs in store["days"].items():
-        try:
-            d = datetime.strptime(d_str, "%Y-%m-%d").date()
-        except Exception:
-            continue
-        if not (week_ago <= d <= today):
-            continue
-        for r in recs:
-            if r.get("final_total") is None:
-                continue
-            total += 1
-            if r["final_total"] >= 3:
-                wins += 1
-                pnl += 1.0
-            else:
-                losses += 1
-                pnl -= 1.0
-
-    lines = [
-        "🗓️ <b>Недельная сводка</b>",
-        f"Период: {week_ago} — {today}",
-        f"Ставок: {total}, Вин: {wins}, Луз: {losses}",
-        f"PnL: {pnl:+.2f} (ставка=1)"
-    ]
-    send("\n".join(lines))
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    start = (now - timedelta(days=6)).date()
+    items = [x for x in STATE.get("history", []) if date.fromisoformat(x["date"]) >= start]
+    txt = ["📅 *Недельная сводка* (последние 7 дней)"]
+    if not items:
+        txt.append("Данных пока нет.")
+    else:
+        txt.append(summarize(items))
+    send("\n".join(txt))
 
 def monthly_report():
-    today = now_local().date()
-    first_day = today.replace(day=1)
-    next_month = (first_day + timedelta(days=32)).replace(day=1)
-    last_day = next_month - timedelta(days=1)
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    first_day = now.replace(day=1).date()
+    items = [x for x in STATE.get("history", []) if date.fromisoformat(x["date"]) >= first_day]
+    txt = ["🗓 *Месячная сводка* (текущий месяц)"]
+    if not items:
+        txt.append("Данных пока нет.")
+    else:
+        txt.append(summarize(items))
+    send("\n".join(txt))
 
-    store = load_store()
-    wins = losses = total = 0
-    pnl = 0.0
+# ================= Скан по стратегии =================
+def scan_and_signal_today():
+    """
+    1) Получаем список матчей на сегодня (status NS/Not Started)
+    2) Фильтруем по стратегии:
+       - последний очный — ТБ2.5
+       - у каждой из команд 2 последних матча — ТБ2.5
+       - (опц.) кэф на ТБ2.5 в диапазоне
+    3) Шлём сигналы и сохраняем в STATE
+    """
+    tz = pytz.timezone(TIMEZONE)
+    today = datetime.now(tz).strftime("%Y-%m-%d")
 
-    for d_str, recs in store["days"].items():
+    # сбросить "сегодня" если дата поменялась
+    last_date_in_state = STATE.get("signals", [{}])[-1].get("date") if STATE.get("signals") else None
+    if last_date_in_state and last_date_in_state != today:
+        reset_today()
+
+    url = "https://v3.football.api-sports.io/fixtures"
+    data = api_get(url, {"date": today})
+    if not data:
+        return
+    fixtures = data.get("response", []) or []
+
+    matches = []
+    for m in fixtures:
         try:
-            d = datetime.strptime(d_str, "%Y-%m-%d").date()
-        except Exception:
-            continue
-        if not (first_day <= d <= last_day):
-            continue
-        for r in recs:
-            if r.get("final_total") is None:
+            if m["fixture"]["status"]["short"] != "NS":
                 continue
-            total += 1
-            if r["final_total"] >= 3:
-                wins += 1
-                pnl += 1.0
-            else:
-                losses += 1
-                pnl -= 1.0
+            home_id = m["teams"]["home"]["id"]
+            away_id = m["teams"]["away"]["id"]
+            home   = m["teams"]["home"]["name"]
+            away   = m["teams"]["away"]["name"]
+            fid    = m["fixture"]["id"]
 
-    lines = [
-        "📅 <b>Месячная сводка</b>",
-        f"Период: {first_day} — {last_day}",
-        f"Ставок: {total}, Вин: {wins}, Луз: {losses}",
-        f"PnL: {pnl:+.2f} (ставка=1)"
-    ]
+            # Проверки стратегии
+            if not last_h2h_is_tb25(home_id, away_id):
+                continue
+            if not last_k_is_tb25_for_team(home_id, k=2):
+                continue
+            if not last_k_is_tb25_for_team(away_id, k=2):
+                continue
+
+            # (Опционально) фильтр по кэфу ТБ2.5
+            odds = odds_over25_for_fixture(fid)
+            if (ODDS_MIN is not None and (odds is None or odds < ODDS_MIN)):
+                continue
+            if (ODDS_MAX is not None and (odds is None or odds > ODDS_MAX)):
+                continue
+
+            matches.append((m, odds))
+        except Exception as e:
+            log.error(f"scan item err: {e}")
+
+    if not matches:
+        send("ℹ️ Скан 08:00: подходящих матчей по стратегии сегодня не найдено.")
+        return
+
+    # Сигналы
+    lines = ["🔥 *Сигналы на сегодня (предматч)*", "_Стратегия: H2H ТБ2.5 + 2/2 ТБ2.5 у обеих_"]
+    for m, odds in matches:
+        home = m["teams"]["home"]["name"]
+        away = m["teams"]["away"]["name"]
+        fid  = m["fixture"]["id"]
+        league = f"{m['league']['country']} — {m['league']['name']}"
+        time_ = m["fixture"]["date"]  # ISO
+        o_str = f"{odds:.2f}" if isinstance(odds, float) else "нет данных"
+
+        # сохраняем сигнал (для отчёта и фиксации результата вечером)
+        STATE["signals"].append({
+            "date": today,
+            "fixture_id": fid,
+            "home": home,
+            "away": away,
+            "league": league,
+            "odds_over25": odds,
+            "result": None,
+        })
+
+        lines.append(
+            f"• {league}\n  {home} — {away}\n  Кэф ТБ2.5: *{o_str}*"
+        )
+
+    save_state()
     send("\n".join(lines))
 
-# ===================== Sleep-resilient scheduler =====================
-
-def scan_due(nowdt, meta):
-    target_hour = 8
-    today = nowdt.strftime("%Y-%m-%d")
-    if meta.get("last_scan_date") == today:
-        return False
-    if nowdt.hour >= target_hour:
-        return True
-    return False
-
-def daily_report_due(nowdt, meta):
-    target = (23, 30)
-    today = nowdt.strftime("%Y-%m-%d")
-    if meta.get("last_daily_report_date") == today:
-        return False
-    if (nowdt.hour, nowdt.minute) >= target:
-        return True
-    return False
-
-def weekly_report_due(nowdt, meta):
-    target = (23, 50)
-    yrwk = f"{nowdt.isocalendar().year}-{nowdt.isocalendar().week:02d}"
-    if meta.get("last_weekly_yrwk") == yrwk:
-        return False
-    if nowdt.weekday() == 6 and (nowdt.hour, nowdt.minute) >= target:
-        return True
-    return False
-
-def monthly_report_due(nowdt, meta):
-    target = (23, 50)
-    yrmo = nowdt.strftime("%Y-%m")
-    tomorrow = nowdt.date() + timedelta(days=1)
-    is_last_day = (tomorrow.day == 1)
-    if meta.get("last_monthly_yrmo") == yrmo:
-        return False
-    if is_last_day and (nowdt.hour, nowdt.minute) >= target:
-        return True
-    return False
-
-# ====== синхронизационный замок, чтобы задачи не накладывались ======
-TASK_LOCK = Lock()
-
+# ================= Главный цикл =================
 def main_loop():
-    send("🚀 Бот запущен (предматч, Render-ready, устойчив к сну).")
-    send("ℹ️ График: скан ≥08:00 1р/день; отчёт ≥23:30; неделя — вс ≥23:50; месяц — в посл. день ≥23:50.")
-    last_log_min = None
+    load_state()
+    send("🚀 Бот запущен (предматч, Render-ready).")
+    send("ℹ️ График: скан в 08:00; отчёт 23:30; неделя — вс 23:50; месяц — в последний день 23:50.")
+
+    last_scan_date = None
+    tz = pytz.timezone(TIMEZONE)
 
     while True:
         try:
-            nowdt = now_local()
-            key = nowdt.strftime("%Y-%m-%d %H:%M")
-            if key != last_log_min:
-                last_log_min = key
-                log.info("tick %s", key)
+            now = datetime.now(tz)
 
-            with TASK_LOCK:
-                store = load_store()
-                meta = store.get("meta", {})
-                changed = False
+            # Скан в 08:00 (раз в день)
+            if now.hour == 8 and now.minute == 0:
+                if last_scan_date != now.date():
+                    scan_and_signal_today()
+                    last_scan_date = now.date()
+                    time.sleep(60)  # чтобы не дергало несколько раз
 
-                if scan_due(nowdt, meta):
-                    scan_today()
-                    meta["last_scan_date"] = nowdt.strftime("%Y-%m-%d")
-                    changed = True
+            # Дневной отчёт 23:30
+            if now.hour == 23 and now.minute == 30:
+                day_report()
+                time.sleep(60)
 
-                if daily_report_due(nowdt, meta):
-                    daily_report()
-                    meta["last_daily_report_date"] = nowdt.strftime("%Y-%m-%d")
-                    changed = True
+            # Недельный отчёт по воскресеньям 23:50
+            if now.hour == 23 and now.minute == 50 and now.weekday() == 6:
+                weekly_report()
+                time.sleep(60)
 
-                if weekly_report_due(nowdt, meta):
-                    weekly_report()
-                    yrwk = f"{nowdt.isocalendar().year}-{nowdt.isocalendar().week:02d}"
-                    meta["last_weekly_yrwk"] = yrwk
-                    changed = True
+            # Месячный отчёт в последний день месяца 23:50
+            tomorrow = now + timedelta(days=1)
+            if now.hour == 23 and now.minute == 50 and tomorrow.month != now.month:
+                monthly_report()
+                time.sleep(60)
 
-                if monthly_report_due(nowdt, meta):
-                    monthly_report()
-                    meta["last_monthly_yrmo"] = nowdt.strftime("%Y-%m")
-                    changed = True
-
-                if changed:
-                    store["meta"] = meta
-                    save_store(store)
-
-            time.sleep(5)
-
+            time.sleep(LOOP_SECONDS)
         except Exception as e:
             log.error(f"main loop error: {e}")
-            time.sleep(5)
+            time.sleep(LOOP_SECONDS)
 
-# ===================== Telegram commands =====================
-
-def owner_only(message):
-    return str(message.chat.id) == str(CHAT_ID)
-
-@bot.message_handler(commands=['help', 'start'])
-def cmd_help(message):
-    if not owner_only(message): return
-    bot.reply_to(message,
-        "Команды:\n"
-        "/scan — дневной прогон сейчас\n"
-        "/report — дневной отчёт сейчас\n"
-        "/weekly — недельная сводка\n"
-        "/monthly — месячная сводка\n"
-        "/status — последние отметки (когда выполнялось)\n"
-    )
-
-@bot.message_handler(commands=['status'])
-def cmd_status(message):
-    if not owner_only(message): return
-    st = load_store().get("meta", {})
-    bot.reply_to(message,
-        "📌 Статус:\n"
-        f"last_scan_date: {st.get('last_scan_date')}\n"
-        f"last_daily_report_date: {st.get('last_daily_report_date')}\n"
-        f"last_weekly_yrwk: {st.get('last_weekly_yrwk')}\n"
-        f"last_monthly_yrmo: {st.get('last_monthly_yrmo')}\n"
-    )
-
-@bot.message_handler(commands=['scan'])
-def cmd_scan(message):
-    if not owner_only(message): return
-    with TASK_LOCK:
-        scan_today()
-        store = load_store()
-        store["meta"]["last_scan_date"] = now_local().strftime("%Y-%m-%d")
-        save_store(store)
-    bot.reply_to(message, "👌 Скан завершён.")
-
-@bot.message_handler(commands=['report'])
-def cmd_report(message):
-    if not owner_only(message): return
-    with TASK_LOCK:
-        daily_report()
-        store = load_store()
-        store["meta"]["last_daily_report_date"] = now_local().strftime("%Y-%m-%d")
-        save_store(store)
-    bot.reply_to(message, "👌 Дневной отчёт отправлен.")
-
-@bot.message_handler(commands=['weekly'])
-def cmd_weekly(message):
-    if not owner_only(message): return
-    with TASK_LOCK:
-        weekly_report()
-        store = load_store()
-        yrwk = f"{now_local().isocalendar().year}-{now_local().isocalendar().week:02d}"
-        store["meta"]["last_weekly_yrwk"] = yrwk
-        save_store(store)
-    bot.reply_to(message, "👌 Недельная сводка отправлена.")
-
-@bot.message_handler(commands=['monthly'])
-def cmd_monthly(message):
-    if not owner_only(message): return
-    with TASK_LOCK:
-        monthly_report()
-        store = load_store()
-        store["meta"]["last_monthly_yrmo"] = now_local().strftime("%Y-%m")
-        save_store(store)
-    bot.reply_to(message, "👌 Месячная сводка отправлена.")
-
-def tg_polling():
-    # устойчиво к сетевым сбоям
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=30)
-        except Exception as e:
-            log.error(f"polling error: {e}")
-            time.sleep(3)
-
-# ===================== RUN =====================
-
+# ================= RUN =================
 if __name__ == "__main__":
-    Thread(target=run_http, daemon=True).start()   # для Render Web Service
-    Thread(target=tg_polling, daemon=True).start() # приём команд
+    # 1) HTTP для Render
+    Thread(target=run_http, daemon=True).start()
+    # 2) Логика
     main_loop()
