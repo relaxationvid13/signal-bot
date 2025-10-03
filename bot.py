@@ -1,381 +1,433 @@
 # -*- coding: utf-8 -*-
 """
-Предматч-сканер (API-FOOTBALL):
- - Ежедневный скан в 08:00 по TZ (Europe/Warsaw по умолчанию).
- - Условия сигнала:
-    1) H2H: в последних 3 очных матчах >=2 были TB2.5
-    2) Форма: у каждой команды в последних 2 играх хотя бы 1 матч TB2.5
-    3) Коэффициент TB2.5: 1.29 <= k <= 2.00 (берём максимум по букмекерам)
- - В 23:30 дневной отчёт, в вс 23:50 недельный, в последний день месяца 23:50 — месячный.
- - Для Render поднимаем HTTP (здоровье) на PORT.
+Предматчевый сканер на API-Football.
+Условия сигнала:
+  - H2H: из последних 3 очных матчей >= 2 были ТБ2.5
+  - Есть котировка ТБ2.5 в диапазоне [ODDS_MIN; ODDS_MAX]
+Форма команд выключена (CHECK_FORM=False), можно включить.
+
+График:
+  - скан: 08:00 по TZ
+  - дневной отчёт: 23:30
+  - недельный отчёт: вс 23:50
+  - месячный отчёт: последний день месяца 23:50
 """
 
-import os, sys, time, json, logging
-from datetime import datetime, date, timedelta
-import pytz, requests, telebot
+import os, sys, json, time, logging
+from datetime import datetime, timedelta, date
+import calendar
+import pytz
+import requests
+import telebot
 
-# --- Render: HTTP health (не убираем) ---
+# --- keep-alive для Render (web service) ---
 from threading import Thread
 from flask import Flask
 app = Flask(__name__)
+
 @app.get("/")
-def health(): return "ok"
+def health():
+    return "ok"
+
 def run_http():
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+# -------------------------------------------
 
-# === Секреты/настройки ===
+# ====== Параметры ======
 API_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY    = os.getenv("API_FOOTBALL_KEY")
 TIMEZONE   = os.getenv("TZ", "Europe/Warsaw")
-
 if not API_TOKEN or not CHAT_ID or not API_KEY:
-    sys.exit("❌ Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / API_FOOTBALL_KEY")
+    sys.exit("❌ Нужно задать TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / API_FOOTBALL_KEY")
 
 CHAT_ID = int(CHAT_ID)
 
-# Порог коэффициента TB2.5
+# Диапазон котировок на ТБ2.5
 ODDS_MIN = 1.29
 ODDS_MAX = 2.00
 
-# H2H: сколько последних брать и сколько из них должны быть TB2.5
+# H2H правило
 H2H_LAST = 3
-H2H_REQUIRE_TB = 2
+H2H_REQUIRE_TB = 2  # из 3 минимум 2 матча с тоталом >=3
 
-# Сколько последних матчей формы каждой команды анализируем
-FORM_LAST = 2
-FORM_REQUIRE_TB = 1   # «в последних 2 — хотя бы 1 TB2.5»
+# Проверка "формы" команд (по умолчанию выключена)
+CHECK_FORM = False
+FORM_LAST = 5
+FORM_REQUIRE_TB = 2
 
-# График
-SCAN_HH, SCAN_MM = 16, 35     # 16:35
-DAILY_HH, DAILY_MM = 23, 30
-WEEKLY_HH, WEEKLY_MM = 23, 50
-MONTHLY_HH, MONTHLY_MM = 23, 50
+# Ставка-единица для отчётов
+STAKE = 1.0
 
 # Файлы
-LOG_FILE = "bot.log"
-STATE_FILE = "signals.json"
+LOG_FILE    = "bot.log"
+STATE_FILE  = "signals.json"  # здесь храним все сигналы и расчёт по датам
 
+# Время задач (часы/минуты в TZ)
+SCAN_HR, SCAN_MIN = (8, 0)           # 08:00 скан на сегодня
+DAILY_HR, DAILY_MIN = (23, 30)       # 23:30 отчёт за день
+WEEKLY_HR, WEEKLY_MIN = (23, 50)     # 23:50 отчёт за неделю (вс)
+MONTHLY_HR, MONTHLY_MIN = (23, 50)   # 23:50 отчёт за месяц (посл. день)
+
+# ====== Логгер ======
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("prematch")
+log = logging.getLogger("prematch-bot")
 
-bot = telebot.TeleBot(API_TOKEN, parse_mode="HTML")
+# ====== Telegram ======
+bot = telebot.TeleBot(API_TOKEN, parse_mode="Markdown")
 
-API = requests.Session()
-API.headers.update({"x-apisports-key": API_KEY})
-DEFAULT_TIMEOUT = 25
+def send(text: str):
+    try:
+        bot.send_message(CHAT_ID, text)
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
 
-# Состояние
-state = {
-    "planned": [],     # [{fixture_id, when_iso, league, home, away, odds, reason}]
-    "history": []      # записи о результатах для отчётов
-}
+# Команда ручного скана
+@bot.message_handler(commands=['scan_now'])
+def cmd_scan_now(m):
+    try:
+        dt = now_local().date()
+        cnt = scan_day(dt)
+        send(f"🔎 Ручной скан выполнен: найдено сигналов: *{cnt}*.")
+    except Exception as e:
+        send(f"❌ Ошибка скана: {e}")
+        log.exception("scan_now failed")
 
-# --- Утилиты времени/состояния ---
+def telebot_polling():
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            log.error(f"telebot polling error: {e}")
+            time.sleep(5)
+
+# ====== API-Football ======
+API_BASE = "https://v3.football.api-sports.io"
+SESS = requests.Session()
+SESS.headers.update({"x-apisports-key": API_KEY})
+
+def api_get(path, params=None, timeout=20):
+    url = f"{API_BASE}/{path}"
+    r = SESS.get(url, params=params or {}, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("response", []) or []
+
+# ====== Вспомогательные ======
 def now_local():
     return datetime.now(pytz.timezone(TIMEZONE))
 
-def today_str():
-    return now_local().strftime("%Y-%m-%d")
-
 def load_state():
-    global state
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
-        except Exception as e:
-            log.error(f"load_state: {e}")
+    if not os.path.exists(STATE_FILE):
+        return {"picks": {}}   # picks: { "YYYY-MM-DD": [ {...}, ... ] }
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.error(f"load_state err: {e}")
+        return {"picks": {}}
 
-def save_state():
+def save_state(state):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log.error(f"save_state: {e}")
+        log.error(f"save_state err: {e}")
 
-def send(msg):
-    try:
-        bot.send_message(CHAT_ID, msg)
-    except Exception as e:
-        log.error(f"Telegram send error: {e}")
+def append_pick(state, d: date, pick: dict):
+    ds = d.isoformat()
+    state.setdefault("picks", {}).setdefault(ds, []).append(pick)
+    save_state(state)
 
-# --- Вызовы API-FOOTBALL ---
-BASE = "https://v3.football.api-sports.io"
+def list_picks_between(state, d1: date, d2: date):
+    """Все сигналы/пики в диапазоне дат включительно."""
+    res = []
+    p = state.get("picks", {})
+    cur = d1
+    while cur <= d2:
+        res.extend(p.get(cur.isoformat(), []))
+        cur += timedelta(days=1)
+    return res
 
-def api_get(path, params):
-    try:
-        r = API.get(BASE + path, params=params, timeout=DEFAULT_TIMEOUT)
-        r.raise_for_status()
-        j = r.json()
-        return j.get("response", []) or []
-    except Exception as e:
-        log.error(f"GET {path} {params} error: {e}")
-        return []
+def settle_pick(fx):
+    """Вернуть (done, win, gh, ga). done==True если финальный счёт; win==True если ТБ2.5."""
+    st = fx["fixture"]["status"]["short"]
+    if st not in ("FT", "AET", "PEN"):
+        return False, None, None, None
+    gh = fx["goals"]["home"] or 0
+    ga = fx["goals"]["away"] or 0
+    win = (gh + ga) > 2.5
+    return True, win, gh, ga
 
-def fixtures_today():
-    return api_get("/fixtures", {"date": today_str(), "status": "NS"})
+# ====== Логика отбора ======
+def goals_total_3plus(m) -> bool:
+    gh = m["goals"]["home"] or 0
+    ga = m["goals"]["away"] or 0
+    return (gh + ga) >= 3
 
-def h2h_total_goals(home_id, away_id, last_n=H2H_LAST):
-    """Возвращает список totals по последним h2h матчам."""
-    rows = api_get("/fixtures/headtohead", {"h2h": f"{home_id}-{away_id}", "last": last_n})
-    totals = []
-    for m in rows:
-        gh = m.get("goals", {}).get("home") or 0
-        ga = m.get("goals", {}).get("away") or 0
-        totals.append(gh+ga)
-    return totals
-
-def team_last_totals(team_id, n=FORM_LAST):
-    rows = api_get("/fixtures", {"team": team_id, "last": n})
-    totals = []
-    for m in rows:
-        gh = m.get("goals", {}).get("home") or 0
-        ga = m.get("goals", {}).get("away") or 0
-        totals.append(gh+ga)
-    return totals
-
-def get_odds_tb25(fixture_id):
-    """
-    Возвращает лучшую (максимальную) котировку на Over 2.5,
-    если market=Over/Under и line="2.5" присутствуют.
-    """
-    rows = api_get("/odds", {"fixture": fixture_id})
-    best = None
-    for book in rows:
-        bookmakers = book.get("bookmakers") or []
-        for bm in bookmakers:
-            bets = bm.get("bets") or []
-            for bet in bets:
-                if (bet.get("name") or "").lower().startswith("over/under"):
-                    for v in bet.get("values") or []:
-                        line = (v.get("value") or "").strip()
-                        odd  = v.get("odd")
-                        if line == "Over 2.5" and odd:
-                            try:
-                                k = float(odd)
-                            except:
-                                continue
-                            if best is None or k > best:
-                                best = k
-    return best
-
-def fixture_score(fixture_id):
-    row = api_get("/fixtures", {"id": fixture_id})
-    if not row: 
-        return None, None
-    m = row[0]
-    st = m.get("fixture", {}).get("status", {}).get("short")
-    gh = m.get("goals", {}).get("home") or 0
-    ga = m.get("goals", {}).get("away") or 0
-    return st, gh+ga
-
-# --- Правила фильтра ---
 def pass_h2h(home_id, away_id):
-    totals = h2h_total_goals(home_id, away_id, H2H_LAST)
-    tb = sum(1 for t in totals if t >= 3)
-    return tb >= H2H_REQUIRE_TB, totals
+    resp = api_get("fixtures/headtohead", {"h2h": f"{home_id}-{away_id}", "last": H2H_LAST})
+    cnt = sum(1 for m in resp if goals_total_3plus(m))
+    return cnt >= H2H_REQUIRE_TB, cnt
+
+def count_tb25_in_last(team_id, last_n):
+    resp = api_get("fixtures", {"team": team_id, "last": last_n})
+    return sum(1 for m in resp if goals_total_3plus(m))
 
 def pass_form(team_id):
-    totals = team_last_totals(team_id, FORM_LAST)
-    tb = sum(1 for t in totals if t >= 3)
-    return tb >= FORM_REQUIRE_TB, totals
+    cnt = count_tb25_in_last(team_id, FORM_LAST)
+    return cnt >= FORM_REQUIRE_TB, cnt
 
-def scan_day():
-    """Сканирует сегодняшние матчи и формирует сигналы."""
-    fixtures = fixtures_today()
-    if not fixtures:
-        send("ℹ️ Сегодня нет матчей для сканирования (или API пуст).")
-        return
+def find_over25_odds(fixture_id):
+    """Возвращает список котировок (по букмекерам) на 'Over 2.5'."""
+    odds_resp = api_get("odds", {"fixture": fixture_id})
+    res = []
+    for book in odds_resp:
+        for market in (book.get("bookmakers") or []):
+            # new format: book['bookmakers'] is a list; each has 'bets'
+            # в API-Football market 'Over/Under'
+            for bet in market.get("bets", []):
+                if bet.get("name", "").lower() in ("over/under", "over-under", "total", "totals"):
+                    for v in bet.get("values", []):
+                        # ищем Over 2.5
+                        val_name = (v.get("value") or "").strip().lower()
+                        if val_name in ("over 2.5", "o 2.5", "2.5 over", "over2.5"):
+                            odd = float(v.get("odd", 0))
+                            if odd > 0:
+                                res.append(odd)
+    # альтернативный древний формат
+    if not res:
+        # odds_resp может быть списком bookmakers на верхнем уровне:
+        for b in odds_resp:
+            for mkt in b.get("bets", []):
+                if mkt.get("name", "").lower() in ("over/under", "over-under", "total", "totals"):
+                    for v in mkt.get("values", []):
+                        val_name = (v.get("value") or "").strip().lower()
+                        if val_name in ("over 2.5", "o 2.5", "2.5 over", "over2.5"):
+                            odd = float(v.get("odd", 0))
+                            if odd > 0:
+                                res.append(odd)
+    return res
 
-    cnt_ok = 0
-    cnt_total = 0
+def pass_odds_range(odds_list):
+    """Есть ли хотя бы одна котировка в диапазоне [ODDS_MIN; ODDS_MAX]."""
+    for x in odds_list:
+        if ODDS_MIN <= x <= ODDS_MAX:
+            return True, x
+    return False, None
 
-    for f in fixtures:
+# ====== Скан дня ======
+def scan_day(d: date) -> int:
+    """Сканируем все матчи на дату d, отправляем сигналы и пишем в базу."""
+    state = load_state()
+    total_signals = 0
+
+    # забираем все матчи за день
+    fixtures = api_get("fixtures", {"date": d.isoformat(), "timezone": TIMEZONE})
+
+    for m in fixtures:
         try:
-            cnt_total += 1
-            fixture_id = f.get("fixture", {}).get("id")
-            league = f.get("league", {})
-            leageline = f"{league.get('country','')} — {league.get('name','')}"
-            teams = f.get("teams", {})
-            home = teams.get("home", {}).get("name", "Home")
-            away = teams.get("away", {}).get("name", "Away")
-            hid  = teams.get("home", {}).get("id")
-            aid  = teams.get("away", {}).get("id")
+            fid = m["fixture"]["id"]
+            home = m["teams"]["home"]["name"]
+            away = m["teams"]["away"]["name"]
+            hid = m["teams"]["home"]["id"]
+            aid = m["teams"]["away"]["id"]
 
-            # 1) H2H
-            ok_h2h, h2h_totals = pass_h2h(hid, aid)
+            # H2H
+            ok_h2h, cnt_h2h = pass_h2h(hid, aid)
             if not ok_h2h:
-                log.info(f"[{home}-{away}] skip: H2H totals={h2h_totals}")
+                log.info(f"[{home}-{away}] skip: h2h cntTB={cnt_h2h}/{H2H_LAST}")
                 continue
 
-            # 2) Форма
-            ok_form_home, form_h = pass_form(hid)
-            ok_form_away, form_a = pass_form(aid)
-            if not (ok_form_home and ok_form_away):
-                log.info(f"[{home}-{away}] skip: form H={form_h} A={form_a}")
+            # Форма (по умолчанию выключена)
+            if CHECK_FORM:
+                ok_home, form_home = pass_form(hid)
+                ok_away, form_away = pass_form(aid)
+                if not (ok_home and ok_away):
+                    log.info(f"[{home}-{away}] skip: form H={form_home}/{FORM_LAST} A={form_away}/{FORM_LAST}")
+                    continue
+
+            # Котировки на Овер 2.5
+            odds = find_over25_odds(fid)
+            ok_odds, chosen_odd = pass_odds_range(odds)
+            if not ok_odds:
+                log.info(f"[{home}-{away}] skip: no odds O2.5 in [{ODDS_MIN};{ODDS_MAX}] (found: {odds[:5]}...)")
                 continue
 
-            # 3) Коэффициенты TB2.5
-            k = get_odds_tb25(fixture_id)
-            if not k:
-                log.info(f"[{home}-{away}] skip: нет котировки TB2.5 от API")
-                continue
-            if not (ODDS_MIN <= k <= ODDS_MAX):
-                log.info(f"[{home}-{away}] skip: k={k} вне диапазона")
-                continue
-
-            # Если дошли сюда — сигнал ✅
-            cnt_ok += 1
-            dt_iso = f.get("fixture", {}).get("date")  # UTC ISO
-            state["planned"].append({
-                "fixture_id": fixture_id,
-                "when_iso": dt_iso,
-                "league": leageline,
+            # сигнал!
+            total_signals += 1
+            pick = {
+                "fixture_id": fid,
                 "home": home,
                 "away": away,
-                "odds": k,
-                "h2h_totals": h2h_totals,
-                "form_home": form_h,
-                "form_away": form_a
-            })
-            save_state()
+                "league": m["league"]["name"],
+                "country": m["league"]["country"],
+                "date": d.isoformat(),
+                "kickoff": m["fixture"]["date"],  # ISO
+                "h2h_tb_cnt": cnt_h2h,
+                "odd": chosen_odd,
+                "market": "O2.5",
+                "created_at": now_local().isoformat(),
+            }
+            append_pick(state, d, pick)
 
             msg = (
-                "⚽ <b>СИГНАЛ (TB2.5)</b>\n"
-                f"🏆 {leageline}\n"
+                "⚽ *Сигнал (предматч)*\n"
+                f"🏆 {pick['country']} — {pick['league']}\n"
                 f"{home} — {away}\n"
-                f"🕒 {dt_iso}\n"
-                f"📊 H2H: {h2h_totals} (треб: ≥{H2H_REQUIRE_TB} из {H2H_LAST} с TB2.5)\n"
-                f"📈 Форма: {home} {form_h}, {away} {form_a}\n"
-                f"💸 TB2.5: <b>{k:.2f}</b>\n"
-                "─────────────"
+                f"⏰ {pick['kickoff']}\n"
+                f"📈 H2H ТБ2.5: {cnt_h2h}/{H2H_LAST}\n"
+                f"🎯 Рынок: ТБ 2.5 | кэф ~ *{chosen_odd:.2f}*\n"
+                "───────────────"
             )
             send(msg)
+            log.info(f"signal: {home}-{away} | odd {chosen_odd}")
 
+            time.sleep(0.2)  # чтобы не спамить API слишком резко
         except Exception as e:
-            log.error(f"scan_day item: {e}")
+            log.exception("scan_day item error")
 
-    send(f"✅ Скан завершён. Найдено сигналов: <b>{cnt_ok}</b> из {cnt_total} матчей.")
+    return total_signals
 
-def daily_report():
-    """Проверяем все planned, формируем дневной отчёт, чистим список."""
-    if not state["planned"]:
-        send("📊 Отчёт за день\nСегодня сигналов не было.")
-        return
+# ====== Отчёты ======
+def fetch_fixture(fid):
+    resp = api_get("fixtures", {"id": fid})
+    return resp[0] if resp else None
 
-    won = lost = 0
-    lines = ["📊 <b>Отчёт за день</b>"]
-
-    for p in state["planned"]:
-        fid = p["fixture_id"]; home=p["home"]; away=p["away"]
-        st, total = fixture_score(fid)
-        if st == "FT":
-            if total >= 3:
-                won += 1
-                lines.append(f"✅ {home} — {away} | {total} | TB2.5 OK | k={p['odds']:.2f}")
-                state["history"].append({"fid":fid,"res":"W","odds":p["odds"],"when":today_str()})
-            else:
-                lost += 1
-                lines.append(f"❌ {home} — {away} | {total} | TB2.5 fail | k={p['odds']:.2f}")
-                state["history"].append({"fid":fid,"res":"L","odds":p["odds"],"when":today_str()})
-        else:
-            # матч ещё не завершён — переносим на завтра
-            lines.append(f"⏳ {home} — {away} | статус {st} | переносим проверку")
-            # возвращаем обратно, не удаляем
+def settle_and_summary(picks):
+    """Возвращает (played, win, lose, open_, profit, lines[])"""
+    played = win = lose = open_ = 0
+    profit = 0.0
+    lines = []
+    for p in picks:
+        fx = fetch_fixture(p["fixture_id"])
+        if not fx:
+            lines.append(f"{p['home']} — {p['away']} | нет данных")
             continue
+        done, iswin, gh, ga = settle_pick(fx)
+        if not done:
+            open_ += 1
+            lines.append(f"{p['home']} {gh}-{ga} {p['away']} | ⏳ ещё идёт")
+            continue
+        played += 1
+        if iswin:
+            win += 1
+            profit += STAKE * (p.get("odd", 1.0) - 1.0)
+            lines.append(f"{p['home']} {gh}-{ga} {p['away']} | ✅ +{STAKE*(p.get('odd',1.0)-1.0):.2f}")
+        else:
+            lose += 1
+            profit -= STAKE
+            lines.append(f"{p['home']} {gh}-{ga} {p['away']} | ❌ -{STAKE:.2f}")
+        time.sleep(0.2)
+    return played, win, lose, open_, profit, lines
 
-    # удаляем из planned только те, что FT (история уже записана)
-    new_planned = []
-    for p in state["planned"]:
-        st, _ = fixture_score(p["fixture_id"])
-        if st != "FT":
-            new_planned.append(p)
-    state["planned"] = new_planned
-    save_state()
+def report_day(d: date):
+    state = load_state()
+    picks = list_picks_between(state, d, d)
+    played, win, lose, open_, profit, lines = settle_and_summary(picks)
+    msg = [
+        "📊 *Отчёт за день*",
+        f"Дата: {d.isoformat()}",
+        f"Ставок: {len(picks)}, Сыграло: {win}, Не сыграло: {lose}, Открыто: {open_}",
+        f"Профит (ставка={STAKE}): *{profit:+.2f}*",
+        "───────────────",
+    ]
+    if lines:
+        msg.extend(lines[:40])   # чтобы не перегружать
+    else:
+        msg.append("За сегодня сигналов не было.")
+    send("\n".join(msg))
 
-    lines.append("─────────────")
-    lines.append(f"Итого: {won} ✅ / {lost} ❌")
-    send("\n".join(lines))
+def report_week(d: date):
+    # неделя: с пон-по вск включительно
+    start = d - timedelta(days=d.weekday())  # понедельник
+    end = start + timedelta(days=6)
+    state = load_state()
+    picks = list_picks_between(state, start, end)
+    played, win, lose, open_, profit, lines = settle_and_summary(picks)
+    msg = [
+        "📊 *Недельная сводка*",
+        f"Период: {start.isoformat()} — {end.isoformat()}",
+        f"Ставок: {len(picks)}, Сыграло: {win}, Не сыграло: {lose}, Открыто: {open_}",
+        f"Профит (ставка={STAKE}): *{profit:+.2f}*",
+    ]
+    send("\n".join(msg))
 
-def weekly_report():
-    """Отчёт по истории последних 7 дней."""
-    cutoff = date.today() - timedelta(days=7)
-    items = [h for h in state["history"]
-             if datetime.fromisoformat(h["when"]) .date() >= cutoff]
-    if not items:
-        send("📅 Недельная сводка: нет данных.")
-        return
-    w = sum(1 for x in items if x["res"]=="W")
-    l = sum(1 for x in items if x["res"]=="L")
-    send(f"📅 <b>Недельная сводка</b>\nЗа 7 дней: {w} ✅ / {l} ❌")
+def report_month(d: date):
+    year, month = d.year, d.month
+    last_day = calendar.monthrange(year, month)[1]
+    start = date(year, month, 1)
+    end = date(year, month, last_day)
+    state = load_state()
+    picks = list_picks_between(state, start, end)
+    played, win, lose, open_, profit, lines = settle_and_summary(picks)
+    msg = [
+        "📊 *Месячная сводка*",
+        f"Период: {start.isoformat()} — {end.isoformat()}",
+        f"Ставок: {len(picks)}, Сыграло: {win}, Не сыграло: {lose}, Открыто: {open_}",
+        f"Профит (ставка={STAKE}): *{profit:+.2f}*",
+    ]
+    send("\n".join(msg))
 
-def monthly_report():
-    """Отчёт по истории за текущий месяц."""
-    today = date.today()
-    month_items = [h for h in state["history"]
-                   if datetime.fromisoformat(h["when"]).date().month == today.month]
-    if not month_items:
-        send("🗓 Месячная сводка: нет данных.")
-        return
-    w = sum(1 for x in month_items if x["res"]=="W")
-    l = sum(1 for x in month_items if x["res"]=="L")
-    send(f"🗓 <b>Месячная сводка</b>\nЗа месяц: {w} ✅ / {l} ❌")
+# ====== Планировщик ======
+def is_sunday(d: date) -> bool:
+    return d.weekday() == 6
 
-# --- Флаги, чтобы не дублировать рассылки ---
-sent_flags = {"scan": None, "daily": None, "weekly": None, "monthly": None}
+def is_last_day_of_month(d: date) -> bool:
+    return d.day == calendar.monthrange(d.year, d.month)[1]
 
-def tick_scheduler():
-    """Ежеминутный таймер: запускает задачи по времени."""
-    tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
+def main_loop():
+    last_scan_date = None
+    last_daily_date = None
+    last_weekly = None  # (year, week)
+    last_month = None   # (year, month)
 
-    # 08:00 — скан
-    if now.hour==SCAN_HH and now.minute==SCAN_MM:
-        k = now.strftime("%Y-%m-%d:%H%M")
-        if sent_flags["scan"] != k:
-            sent_flags["scan"] = k
-            scan_day()
+    # приветствие
+    send("🚀 Бот запущен (предматч, Render-ready). ❤️")
+    send("ℹ️ График: скан в 08:00; отчёт 23:30; неделя — вс 23:50; месяц — в последний день 23:50.")
 
-    # 23:30 — дневной отчёт
-    if now.hour==DAILY_HH and now.minute==DAILY_MM:
-        k = now.strftime("%Y-%m-%d:%H%M")
-        if sent_flags["daily"] != k:
-            sent_flags["daily"] = k
-            daily_report()
-
-    # вс 23:50 — недельный
-    if now.weekday()==6 and now.hour==WEEKLY_HH and now.minute==WEEKLY_MM:
-        k = now.strftime("%Y-%m-%d:%H%M")
-        if sent_flags["weekly"] != k:
-            sent_flags["weekly"] = k
-            weekly_report()
-
-    # последний день месяца 23:50 — месячный
-    tomorrow = now.date() + timedelta(days=1)
-    last_day = (tomorrow.day == 1)  # значит сегодня — последний день месяца
-    if last_day and now.hour==MONTHLY_HH and now.minute==MONTHLY_MM:
-        k = now.strftime("%Y-%m-%d:%H%M")
-        if sent_flags["monthly"] != k:
-            sent_flags["monthly"] = k
-            monthly_report()
-
-# === RUN ===
-if __name__ == "__main__":
-    Thread(target=run_http, daemon=True).start()
-    load_state()
-
-    send("🚀 Бот запущен (предматч, Render-ready).")
-    send(f"ℹ️ График: скан в {SCAN_HH:02d}:{SCAN_MM:02d}; отчёт {DAILY_HH:02d}:{DAILY_MM:02d}; "
-         f"неделя — вс {WEEKLY_HH:02d}:{WEEKLY_MM:02d}; месяц — в последний день {MONTHLY_HH:02d}:{MONTHLY_MM:02d}.")
-
-    # главный петлевой планировщик
     while True:
         try:
-            tick_scheduler()
-            time.sleep(60)   # ежеминутно достаточно
+            now = now_local()
+            d = now.date()
+
+            # Скан в 08:00  (один раз в день)
+            if (now.hour, now.minute) == (SCAN_HR, SCAN_MIN) and last_scan_date != d:
+                cnt = scan_day(d)
+                send(f"✅ Скан на {d.isoformat()} завершён. Найдено сигналов: *{cnt}*.")
+                last_scan_date = d
+
+            # Дневной отчёт 23:30
+            if (now.hour, now.minute) == (DAILY_HR, DAILY_MIN) and last_daily_date != d:
+                report_day(d)
+                last_daily_date = d
+
+            # Недельный — по воскресеньям 23:50
+            year, week, _ = now.isocalendar()
+            if is_sunday(d) and (now.hour, now.minute) == (WEEKLY_HR, WEEKLY_MIN):
+                if last_weekly != (year, week):
+                    report_week(d)
+                    last_weekly = (year, week)
+
+            # Месячный — в последний день 23:50
+            if is_last_day_of_month(d) and (now.hour, now.minute) == (MONTHLY_HR, MONTHLY_MIN):
+                ym = (d.year, d.month)
+                if last_month != ym:
+                    report_month(d)
+                    last_month = ym
+
+            time.sleep(1)
         except Exception as e:
-            log.error(f"main loop: {e}")
-            time.sleep(60)
+            log.exception("main_loop error")
+            time.sleep(5)
+
+# ====== RUN ======
+if __name__ == "__main__":
+    # web-keepalive для Render
+    Thread(target=run_http, daemon=True).start()
+    # телеграм-поллинг
+    Thread(target=telebot_polling, daemon=True).start()
+    # основной цикл
+    main_loop()
