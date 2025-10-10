@@ -1,302 +1,384 @@
 # -*- coding: utf-8 -*-
 """
-Непадающий каркас бота для Render:
-- HTTP health на / (чтобы Render не выключал web-сервис)
-- Безопасные проверки окружения (не падает при отсутствии)
-- Команды /start /ping /status /scan
-- Периодические задачи (08:00 scan, 23:30 daily, вс 23:50 weekly, последний день 23:50 monthly)
-- Весь код окружён try/except с логами
+Render-ready Telegram bot (pre-match scanner).
+Стратегия: если есть явный фаворит по 1X2, даём сигнал на "1-й тайм ТБ 0.5".
+- Авто-скан в 08:00 (Europe/Warsaw)
+- Дневной отчёт в 23:30
+- Ручной запуск: /scan
+- Открываем HTTP-порт (Flask), чтобы Render не гасил процесс
+- Берём ВСЕ лиги (без фильтра стран), как ты просила для теста
 """
+
 import os
 import sys
 import time
 import json
-import pytz
-import traceback
-import threading
-from datetime import datetime, timedelta, date
+import logging
+from datetime import datetime
 
+import pytz
+import requests
+import telebot
+from threading import Thread
 from flask import Flask
 
-# Телеграм — опционально (если нет токена — просто не шлём)
-try:
-    import telebot
-except Exception:
-    telebot = None
+# ========= ТВОИ ДАННЫЕ (можно править тут или через ENV) =========
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7980925106:AAG-kjxNUWjRGN0YzyUEaS_Wyd2rfWmQ6Nc")
+TELEGRAM_CHAT_ID   = int(os.getenv("TELEGRAM_CHAT_ID", "1244865850"))
+API_FOOTBALL_KEY   = os.getenv("API_FOOTBALL_KEY", "a5643739fb001333ba7b99b5bb67508e")
+TZ                 = os.getenv("TZ", "Europe/Warsaw")
 
+# Стратегия (можно поднять/опустить пороги)
+FAVORITE_MAX_ODDS = float(os.getenv("FAVORITE_MAX_ODDS", "1.70"))  # макс. кэф фаворита по 1X2
+FH_O05_MIN_ODDS   = float(os.getenv("FH_O05_MIN_ODDS", "1.20"))    # мин. кэф на ТБ0.5 (1Т), если есть
+FH_O05_MAX_ODDS   = float(os.getenv("FH_O05_MAX_ODDS", "1.80"))    # макс. кэф на ТБ0.5 (1Т), если есть
 
-# ====================== Настройки окружения ======================
+# Сразу сделать скан после запуска (удобно для теста)
+RUN_ON_START = os.getenv("RUN_ON_START", "1") == "1"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TZ_NAME            = os.getenv("TZ", "Europe/Warsaw").strip()
+# ========= Логи/состояние =========
+LOG_FILE   = "bot.log"
+STATE_FILE = "signals.json"
 
-# Частота «тика» основного цикла
-TICK_SECONDS = 30  # каждые 30 секунд
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+                    format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("scanner")
 
-# Времена срабатывания (локальное время TZ_NAME)
-SCAN_TIME     = (8, 0)    # 08:00
-DAILY_TIME    = (23, 30)  # 23:30
-WEEKLY_TIME   = (23, 50)  # 23:50 каждое воскресенье
-MONTHLY_TIME  = (23, 50)  # 23:50 в последний день месяца
-
-# Папка для лёгких состояний/файлов (дни запуска и пр.)
-STATE_FILE = "runtime_state.json"
-
-
-# ====================== Утилиты логирования ======================
-
-def log(msg: str):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{ts}] {msg}", flush=True)
-
-
-# ====================== Часы/таймзона ======================
-
-def now_local():
-    tz = pytz.timezone(TZ_NAME)
-    return datetime.now(tz)
-
-def is_last_day_of_month(dt: datetime) -> bool:
-    tomorrow = dt + timedelta(days=1)
-    return tomorrow.month != dt.month
-
-
-# ====================== HTTP health для Render ======================
-
+# ========= HTTP (Render health) =========
 app = Flask(__name__)
 
 @app.get("/")
-def health():
+def healthcheck():
     return "ok"
 
 def run_http():
     port = int(os.getenv("PORT", "10000"))
-    log(f"[boot] HTTP health server on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
 
+# ========= Telegram =========
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not API_FOOTBALL_KEY:
+    sys.exit("❌ Нужны TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, API_FOOTBALL_KEY")
 
-# ====================== Телеграм обёртки ======================
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="Markdown")
 
-def can_telegram():
-    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and telebot)
-
-def send_telegram(text: str):
-    """Безопасная отправка. Если не настроено — только лог."""
-    if not can_telegram():
-        log(f"[TG disabled] {text}")
-        return
+def send(text: str):
     try:
-        bot.send_message(int(TELEGRAM_CHAT_ID), text)
-    except Exception:
-        log("[TG error] " + text)
-        traceback.print_exc()
+        bot.send_message(TELEGRAM_CHAT_ID, text)
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
 
+# ========= API-Football =========
+API = requests.Session()
+API.headers.update({"x-apisports-key": API_FOOTBALL_KEY})
+DEFAULT_TIMEOUT = 20
+BASE = "https://v3.football.api-sports.io"
 
-# ====================== Лёгкое состояние ======================
+def api_get(endpoint: str, params: dict):
+    url = f"{BASE}/{endpoint}"
+    try:
+        r = API.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+        if r.status_code != 200:
+            log.warning("HTTP %s %s %s", r.status_code, url, r.text[:200])
+        r.raise_for_status()
+        return r.json().get("response", []) or []
+    except Exception as e:
+        log.error(f"api_get {endpoint} err: {e}")
+        return []
+
+# ========= Память за день =========
+signals_today = []
+signaled_fixtures = set()
 
 def load_state():
+    global signals_today, signaled_fixtures
+    if not os.path.exists(STATE_FILE):
+        return
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        traceback.print_exc()
-    return {
-        "last_scan_date": "",     # "YYYY-MM-DD"
-        "last_daily_date": "",
-        "last_weekly_date": "",
-        "last_monthly_stamp": "",  # "YYYY-MM" (месяц отчёта)
-    }
+        data = json.load(open(STATE_FILE, "r", encoding="utf-8"))
+        if data.get("day") == now_local().strftime("%Y-%m-%d"):
+            signals_today = data.get("signals", [])
+            signaled_fixtures = set(data.get("signaled", []))
+    except Exception as e:
+        log.error(f"load_state error: {e}")
 
-def save_state(st):
+def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
-    except Exception:
-        traceback.print_exc()
+            json.dump({
+                "day": now_local().strftime("%Y-%m-%d"),
+                "signals": signals_today,
+                "signaled": list(signaled_fixtures)
+            }, f, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"save_state error: {e}")
 
+# ========= Утилиты =========
+def now_local():
+    return datetime.now(pytz.timezone(TZ))
 
-STATE = load_state()
+def fmt_team(t):  # team dict -> name
+    return (t.get("name") or "").strip()
 
+def choose_favorite_from_1x2(bet: dict):
+    """
+    bet = {'name': 'Match Winner', 'values': [{'value':'Home','odd':'1.45'}, {'value':'Draw',...}, {'value':'Away','odd':'6.50'}]}
+    -> ('Home'/'Away', odd) или (None, None)
+    """
+    if not bet or "values" not in bet:
+        return None, None
+    home_odd = away_odd = None
+    for v in bet["values"]:
+        val = (v.get("value") or "").lower()
+        try:
+            odd = float(v.get("odd"))
+        except:
+            continue
+        if val in ("home", "1"):
+            home_odd = odd
+        elif val in ("away", "2"):
+            away_odd = odd
+    if home_odd is None and away_odd is None:
+        return None, None
+    if home_odd is not None and (away_odd is None or home_odd <= away_odd):
+        return "Home", home_odd
+    if away_odd is not None:
+        return "Away", away_odd
+    return None, None
 
-# ====================== Заглушки бизнес-логики ======================
+def find_bet(bets: list, key_words: list):
+    """ Найти bet по ключевым словам в названии (без учёта регистра). """
+    for b in bets or []:
+        name = (b.get("name") or "").lower()
+        if all(kw.lower() in name for kw in key_words):
+            return b
+    return None
 
-def do_scan():
-    """Тут будет реальная логика сканирования матчей.
-       Пока шлём простое уведомление, чтобы видеть срабатывание."""
-    dt = now_local().strftime("%Y-%m-%d %H:%M %Z")
-    send_telegram(f"🔎 Сканирование (заглушка): {dt}\n"
-                  f"Позже сюда вставим реальную логику.")
+def get_fh_over05_odds(bets: list):
+    """
+    Ищем коэффициент на 'Over 0.5 - 1st Half'
+    """
+    candidate = None
+    for b in bets or []:
+        name = (b.get("name") or "").lower()
+        if ("over" in name and "under" in name and "1st" in name and "half" in name) or ("1st half" in name and "goals" in name):
+            candidate = b
+            break
+    if not candidate:
+        return None
+    for v in candidate.get("values", []):
+        label = (v.get("value") or "").lower().replace(" ", "")
+        if "over" in label and ("0.5" in label or "0,5" in label):
+            try:
+                return float(v.get("odd"))
+            except:
+                return None
+    return None
+
+def odds_for_fixture(fixture_id: int):
+    """
+    Возвращаем:
+      fav_side ('Home'/'Away') или None,
+      fav_odds,
+      fh_over05_odds (или None)
+    """
+    data = api_get("odds", {"fixture": fixture_id})
+    if not data:
+        return None, None, None
+
+    fav_side = None
+    fav_odds = None
+    fh_o05 = None
+
+    for bm in data:
+        bets = bm.get("bets") or []
+        bet_1x2 = find_bet(bets, ["match", "winner"]) or find_bet(bets, ["1x2"])
+        fside, fodd = choose_favorite_from_1x2(bet_1x2)
+        if fside and fodd:
+            if (fav_odds is None) or (fodd < fav_odds):
+                fav_side = fside
+                fav_odds = fodd
+        fh = get_fh_over05_odds(bets)
+        if fh is not None:
+            if fh_o05 is None or fh < fh_o05:
+                fh_o05 = fh
+
+    return fav_side, fav_odds, fh_o05
+
+def fixtures_today():
+    """
+    Все матчи на сегодня (статусы: NS/TBD/PST), без ограничений по лигам/странам.
+    """
+    d = now_local().strftime("%Y-%m-%d")
+    data = api_get("fixtures", {"date": d, "timezone": TZ})
+    out = []
+    for m in data:
+        status = ((m.get("fixture") or {}).get("status") or {}).get("short")
+        if status in ("NS", "TBD", "PST"):
+            out.append(m)
+    return out
+
+def build_signal_text(fix, fav_side, fav_odds, fh_o05_odds):
+    f = fix["fixture"]; l = fix["league"]; t = fix["teams"]
+    dt = datetime.fromtimestamp(f["timestamp"], pytz.timezone(TZ)).strftime("%H:%M")
+    home = fmt_team(t["home"]); away = fmt_team(t["away"])
+    league_line = f"🏆 {l['country']} — {l['name']} (сезон {l['season']})"
+    fav_line = f"⭐ Фаворит: {'Дом' if fav_side=='Home' else 'Гости'} @ {fav_odds:.2f}"
+    o05_line = f"⏱ 1Т ТБ 0.5: {fh_o05_odds:.2f}" if fh_o05_odds else "⏱ 1Т ТБ 0.5: нет котировок"
+    return (
+        "⚪ *Сигнал (прематч)*\n"
+        f"{league_line}\n"
+        f"{home} — {away}  |  {dt}\n"
+        f"{fav_line}\n"
+        f"{o05_line}\n"
+        "─────────────"
+    )
+
+def passes_strategy(fav_side, fav_odds, fh_o05_odds):
+    """
+    Условия:
+      1) есть фаворит и его 1х2 <= FAVORITE_MAX_ODDS
+      2) если есть котировка на 1Т ТБ0.5 — она в [FH_O05_MIN_ODDS ; FH_O05_MAX_ODDS]
+         если котировки нет — сигнал всё равно отправляем (по фавориту).
+    """
+    if not fav_side or not fav_odds:
+        return False
+    if fav_odds > FAVORITE_MAX_ODDS:
+        return False
+    if fh_o05_odds is None:
+        return True
+    return FH_O05_MIN_ODDS <= fh_o05_odds <= FH_O05_MAX_ODDS
+
+# ========= Скан/отчёт =========
+def run_scan():
+    count_checked = 0
+    count_signals = 0
+    fixtures = fixtures_today()
+    for m in fixtures:
+        try:
+            fid = m["fixture"]["id"]
+        except:
+            continue
+        if fid in signaled_fixtures:
+            continue
+        fav_side, fav_odds, fh_o05 = odds_for_fixture(fid)
+        if passes_strategy(fav_side, fav_odds, fh_o05):
+            send(build_signal_text(m, fav_side, fav_odds, fh_o05))
+            rec = {
+                "fixture_id": fid,
+                "home": fmt_team(m["teams"]["home"]),
+                "away": fmt_team(m["teams"]["away"]),
+                "league": m["league"]["name"],
+                "country": m["league"]["country"],
+                "fav_side": fav_side,
+                "fav_odds": fav_odds,
+                "fh_o05": fh_o05,
+                "kickoff": m["fixture"]["timestamp"],
+            }
+            signals_today.append(rec)
+            signaled_fixtures.add(fid)
+            count_signals += 1
+        count_checked += 1
+
+    save_state()
+    send(f"🔎 Скан закончен: проверено {count_checked}, сигналов {count_signals}.")
 
 def send_daily_report():
-    dt = now_local().strftime("%Y-%m-%d %H:%M %Z")
-    send_telegram(f"📊 Дневной отчёт (заглушка): {dt}\n"
-                  f"Здесь будет реальная статистика за день.")
+    lines = ["📊 *Отчёт за день (прематч)*"]
+    lines.append(f"Дата: {now_local().strftime('%Y-%m-%d')}")
+    lines.append(f"Сигналов отправлено: {len(signals_today)}")
+    if not signals_today:
+        lines.append("За сегодня сигналов не было.")
+        send("\n".join(lines)); return
 
-def send_weekly_report():
-    dt = now_local().strftime("%Y-%m-%d %H:%M %Z")
-    send_telegram(f"🗓 Недельная сводка (заглушка): {dt}\n"
-                  f"Здесь будет реальная статистика за неделю.")
+    for i, s in enumerate(signals_today, 1):
+        tm = datetime.fromtimestamp(s["kickoff"], pytz.timezone(TZ)).strftime("%H:%M")
+        fav = "Дом" if s["fav_side"] == "Home" else "Гости"
+        o05 = f"{s['fh_o05']:.2f}" if s["fh_o05"] else "нет"
+        lines.append(f"{i:02d}. {s['home']} — {s['away']} [{tm}] | fav {fav} @{s['fav_odds']:.2f} | 1Т ТБ0.5: {o05}")
 
-def send_monthly_report():
-    dt = now_local().strftime("%Y-%m-%d %H:%M %Z")
-    send_telegram(f"📅 Месячная сводка (заглушка): {dt}\n"
-                  f"Здесь будет реальная статистика за месяц.")
+    send("\n".join(lines))
 
+# ========= Команды =========
+@bot.message_handler(commands=["start", "help"])
+def on_help(msg):
+    send(
+        "Привет! Я сканирую прематч по стратегии *фаворит → 1Т ТБ 0.5*.\n\n"
+        "Команды:\n"
+        "• /scan — запустить скан сейчас\n"
+        "• /status — статус и параметры\n"
+        f"Скан ежедневно в 08:00, отчёт в 23:30 (TZ: {TZ})."
+    )
 
-# ====================== Планировщик ======================
+@bot.message_handler(commands=["status"])
+def on_status(msg):
+    lines = [
+        "ℹ️ *Статус*",
+        f"TZ: {TZ}",
+        f"Фаворит по 1х2 ≤ {FAVORITE_MAX_ODDS:.2f}",
+        f"1Т ТБ0.5 коридор: [{FH_O05_MIN_ODDS:.2f} ; {FH_O05_MAX_ODDS:.2f}]",
+        f"Сегодня сигналов: {len(signals_today)}",
+    ]
+    send("\n".join(lines))
 
-def should_fire(hour_min_tuple) -> bool:
-    """Проверяем, что текущее локальное время попало в нужную минуту."""
-    hh, mm = hour_min_tuple
-    now = now_local()
-    return (now.hour == hh) and (now.minute == mm)
-
-def cron_tick():
-    """Один «тик» планировщика — решает, что запускать."""
-    global STATE
-
-    now = now_local()
-    today = now.strftime("%Y-%m-%d")
-
-    # 1) Ежедневный скан в 08:00
-    if should_fire(SCAN_TIME):
-        if STATE.get("last_scan_date") != today:
-            log("Run: do_scan()")
-            try:
-                do_scan()
-                STATE["last_scan_date"] = today
-                save_state(STATE)
-            except Exception:
-                traceback.print_exc()
-
-    # 2) Ежедневный отчёт в 23:30
-    if should_fire(DAILY_TIME):
-        if STATE.get("last_daily_date") != today:
-            log("Run: send_daily_report()")
-            try:
-                send_daily_report()
-                STATE["last_daily_date"] = today
-                save_state(STATE)
-            except Exception:
-                traceback.print_exc()
-
-    # 3) Недельный (вс) 23:50
-    if should_fire(WEEKLY_TIME) and now.weekday() == 6:  # Monday=0 ... Sunday=6
-        if STATE.get("last_weekly_date") != today:
-            log("Run: send_weekly_report()")
-            try:
-                send_weekly_report()
-                STATE["last_weekly_date"] = today
-                save_state(STATE)
-            except Exception:
-                traceback.print_exc()
-
-    # 4) Месячный в последний день месяца 23:50
-    if should_fire(MONTHLY_TIME) and is_last_day_of_month(now):
-        ym = now.strftime("%Y-%m")  # месяц отчёта
-        if STATE.get("last_monthly_stamp") != ym:
-            log("Run: send_monthly_report()")
-            try:
-                send_monthly_report()
-                STATE["last_monthly_stamp"] = ym
-                save_state(STATE)
-            except Exception:
-                traceback.print_exc()
-
-
-# ====================== Телеграм-бот (команды) ======================
-
-bot = None
-if can_telegram():
+@bot.message_handler(commands=["scan"])
+def on_scan(msg):
+    send("Запустил сканирование ✅")
     try:
-        bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+        run_scan()
+    except Exception as e:
+        log.error(f"/scan error: {e}")
+        send("❌ Ошибка при сканировании, см. логи.")
 
-        @bot.message_handler(commands=["start"])
-        def cmd_start(m):
-            msg = (
-                "Привет! Я живу на Render 👋\n\n"
-                "Команды:\n"
-                "• /ping — проверить отклик\n"
-                "• /status — расписание и TZ\n"
-                "• /scan — вручную запустить скан\n"
-            )
-            bot.send_message(m.chat.id, msg)
+# ========= Планировщик (простая проверка времени) =========
+def timers_loop():
+    last_scan_mark = None
+    last_report_mark = None
+    tz = pytz.timezone(TZ)
 
-        @bot.message_handler(commands=["ping"])
-        def cmd_ping(m):
-            bot.send_message(m.chat.id, "pong ✅")
-
-        @bot.message_handler(commands=["status"])
-        def cmd_status(m):
-            info = (
-                f"🕒 TZ={TZ_NAME}\n"
-                f"🔎 Скан: {SCAN_TIME[0]:02d}:{SCAN_TIME[1]:02d}\n"
-                f"📊 Дневной отчёт: {DAILY_TIME[0]:02d}:{DAILY_TIME[1]:02d}\n"
-                f"🗓 Недельный (вс): {WEEKLY_TIME[0]:02d}:{WEEKLY_TIME[1]:02d}\n"
-                f"📅 Месячный (посл. день): {MONTHLY_TIME[0]:02d}:{MONTHLY_TIME[1]:02d}\n"
-            )
-            bot.send_message(m.chat.id, info)
-
-        @bot.message_handler(commands=["scan"])
-        def cmd_scan(m):
-            try:
-                do_scan()
-                bot.send_message(m.chat.id, "Запустил сканирование ✅")
-            except Exception:
-                traceback.print_exc()
-                bot.send_message(m.chat.id, "Ошибка при сканировании ❌")
-
-        def run_tg():
-            log("[boot] Telegram polling started")
-            while True:
-                try:
-                    bot.infinity_polling(timeout=30, long_polling_timeout=30)
-                except Exception:
-                    traceback.print_exc()
-                    time.sleep(5)
-
-        threading.Thread(target=run_tg, daemon=True).start()
-
-    except Exception:
-        log("WARN: Не удалось инициализировать телеграм-бота.")
-        traceback.print_exc()
-else:
-    log("INFO: Telegram отключён (нет токена/чат_id или pyTelegramBotAPI).")
-
-
-# ====================== Главный цикл ======================
-
-def main_loop():
-    log("Main loop started.")
     while True:
         try:
-            cron_tick()           # проверяем расписание
-            log("Tick: alive.")   # видно в логах Render, что живём
-            time.sleep(TICK_SECONDS)
-        except Exception:
-            log("ERROR in main loop:")
-            traceback.print_exc()
-            time.sleep(5)         # чтобы не крутить ошибки слишком часто
+            now = datetime.now(tz)
+            day_key = now.strftime("%Y-%m-%d")
 
+            # 08:00 — авто-скан (один раз в день)
+            if now.hour == 8 and now.minute == 0:
+                if last_scan_mark != day_key:
+                    send("⏰ 08:00 — авто-скан запускается.")
+                    run_scan()
+                    last_scan_mark = day_key
 
-# ====================== Старт ======================
+            # 23:30 — дневной отчёт
+            if now.hour == 23 and now.minute == 30:
+                if last_report_mark != day_key:
+                    send_daily_report()
+                    last_report_mark = day_key
 
+        except Exception as e:
+            log.error(f"timers_loop error: {e}")
+
+        time.sleep(30)
+
+# ========= ENTRY =========
 if __name__ == "__main__":
-    # 1) HTTP health для Render
-    threading.Thread(target=run_http, daemon=True).start()
+    # HTTP для Render
+    Thread(target=run_http, daemon=True).start()
 
-    # 2) Приветственное сообщение при старте
+    load_state()
+
+    send("🚀 Бот запущен (прематч, фаворит → 1Т ТБ 0.5).")
+    send("ℹ️ Авто-скан 08:00, отчёт 23:30. Для теста: /scan")
+
+    # Разовый скан сразу после старта (удобно проверить)
+    if RUN_ON_START:
+        try:
+            send("↻ RUN_ON_START=1 — делаю разовый скан сейчас.")
+            run_scan()
+        except Exception as e:
+            log.error(f"RUN_ON_START scan error: {e}")
+
+    Thread(target=timers_loop, daemon=True).start()
+
     try:
-        send_telegram(
-            "🚀 Бот запущен (стабильная версия, Render-ready).\n"
-            f"ℹ️ TZ={TZ_NAME}. "
-            f"Скан 08:00, дневной 23:30, недельный вс 23:50, месячный посл. день 23:50.\n"
-            "Для ручного запуска: /scan"
-        )
-    except Exception:
-        traceback.print_exc()
-
-    # 3) Основной цикл
-    main_loop()
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    except Exception as e:
+        log.error(f"bot.infinity_polling error: {e}")
